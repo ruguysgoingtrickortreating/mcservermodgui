@@ -1,0 +1,832 @@
+//! Build and show dropdown menus.
+//!
+//! CUSTOM: Support for None selection, multi and exclude/include added
+use crate::pick_list_multi::SelectionState;
+
+use iced_core::alignment;
+use iced_core::border::{self, Border};
+use iced_core::layout::{self, Layout};
+use iced_core::mouse;
+use iced_core::overlay;
+use iced_core::renderer;
+use iced_core::text::{self, Text};
+use iced_core::touch;
+use iced_core::widget::tree::{self, Tree};
+use iced_core::window;
+use iced_core::{
+    Background, Clipboard, Color, Event, Length, Padding, Pixels, Point, Rectangle, Shadow, Size,
+    Theme, Vector,
+};
+use iced_core::{Element, Shell, Widget};
+use iced_widget::scrollable::{self, Scrollable};
+
+use std::borrow::Borrow;
+
+/// A list of selectable options.
+pub struct Menu<'a, 'b, T, V, Message, Theme = iced_core::Theme, Renderer = iced_widget::Renderer>
+where
+    Theme: Catalog,
+    Renderer: text::Renderer,
+    'b: 'a,
+{
+    state: &'a mut State,
+    options: &'a [T],
+    symbols: [&'a str; 3],
+    optional: bool,
+    none_label: &'a String,
+    none_separator: bool,
+    exclusion_mode: bool,
+    hovered_option: &'a mut Option<usize>,
+    selection: &'a Vec<(Option<V>, SelectionState)>,
+    on_selected: Box<dyn FnMut((Option<T>, SelectionState)) -> Message + 'a>,
+    on_option_hovered: Option<&'a dyn Fn(Option<T>) -> Message>,
+    width: f32,
+    padding: Padding,
+    text_size: Option<Pixels>,
+    text_line_height: text::LineHeight,
+    font: Option<Renderer::Font>,
+    symbols_font: Option<Renderer::Font>,
+    class: &'a <Theme as Catalog>::Class<'b>,
+}
+
+impl<'a, 'b, T, V, Message, Theme, Renderer> Menu<'a, 'b, T, V, Message, Theme, Renderer>
+where
+    T: ToString + PartialEq + Clone,
+    V: Borrow<T> + 'a,
+    Message: 'a,
+    Theme: Catalog + 'a,
+    Renderer: text::Renderer + 'a,
+    'b: 'a,
+{
+    /// Creates a new [`Menu`] with the given [`State`], a list of options,
+    /// the message to produced when an option is selected, and its [`Style`].
+    pub fn new(
+        state: &'a mut State,
+        options: &'a [T],
+        symbols: [&'a str; 3],
+        optional: bool,
+        none_label: &'a String,
+        none_separator: bool,
+        exclusion_mode: bool,
+        hovered_option: &'a mut Option<usize>,
+        selection: &'a Vec<(Option<V>, SelectionState)>,
+        on_selected: impl FnMut((Option<T>, SelectionState)) -> Message + 'a,
+        on_option_hovered: Option<&'a dyn Fn(Option<T>) -> Message>,
+        class: &'a <Theme as Catalog>::Class<'b>,
+    ) -> Self {
+        Menu {
+            state,
+            options,
+            symbols,
+            optional,
+            none_label,
+            none_separator,
+            exclusion_mode,
+            hovered_option,
+            selection,
+            on_selected: Box::new(on_selected),
+            on_option_hovered,
+            width: 0.0,
+            padding: Padding::ZERO,
+            text_size: None,
+            text_line_height: text::LineHeight::default(),
+            font: None,
+            symbols_font: None,
+            class,
+        }
+    }
+
+    /// Sets the width of the [`Menu`].
+    pub fn width(mut self, width: f32) -> Self {
+        self.width = width;
+        self
+    }
+
+    /// Sets the [`Padding`] of the [`Menu`].
+    pub fn padding<P: Into<Padding>>(mut self, padding: P) -> Self {
+        self.padding = padding.into();
+        self
+    }
+
+    /// Sets the text size of the [`Menu`].
+    pub fn text_size(mut self, text_size: impl Into<Pixels>) -> Self {
+        self.text_size = Some(text_size.into());
+        self
+    }
+
+    /// Sets the text [`text::LineHeight`] of the [`Menu`].
+    #[allow(dead_code)]
+    pub fn text_line_height(mut self, line_height: impl Into<text::LineHeight>) -> Self {
+        self.text_line_height = line_height.into();
+        self
+    }
+
+    /// Sets the font of the [`Menu`].
+    pub fn font(mut self, font: impl Into<Renderer::Font>) -> Self {
+        self.font = Some(font.into());
+        self
+    }
+
+    /// Sets the symbols font of the [`Menu`].
+    pub fn symbols_font(mut self, font: impl Into<Renderer::Font>) -> Self {
+        self.symbols_font = Some(font.into());
+        self
+    }
+
+    /// Turns the [`Menu`] into an overlay [`Element`] at the given target
+    /// position.
+    ///
+    /// The `target_height` will be used to display the menu either on top
+    /// of the target or under it, depending on the screen position and the
+    /// dimensions of the [`Menu`].
+    pub fn overlay(
+        self,
+        position: Point,
+        viewport: Rectangle,
+        target_height: f32,
+        menu_height: Length,
+    ) -> overlay::Element<'a, Message, Theme, Renderer> {
+        overlay::Element::new(Box::new(Overlay::new(
+            position,
+            viewport,
+            self,
+            target_height,
+            menu_height,
+        )))
+    }
+}
+
+/// The local state of a [`Menu`].
+#[derive(Debug)]
+pub struct State {
+    tree: Tree,
+}
+
+impl State {
+    /// Creates a new [`State`] for a [`Menu`].
+    pub fn new() -> Self {
+        Self {
+            tree: Tree::empty(),
+        }
+    }
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+struct Overlay<'a, 'b, Message, Theme, Renderer>
+where
+    Theme: Catalog,
+    Renderer: text::Renderer,
+{
+    position: Point,
+    viewport: Rectangle,
+    tree: &'a mut Tree,
+    list: Scrollable<'a, Message, Theme, Renderer>,
+    width: f32,
+    target_height: f32,
+    class: &'a <Theme as Catalog>::Class<'b>,
+}
+
+impl<'a, 'b, Message, Theme, Renderer> Overlay<'a, 'b, Message, Theme, Renderer>
+where
+    Message: 'a,
+    Theme: Catalog + scrollable::Catalog + 'a,
+    Renderer: text::Renderer + 'a,
+    'b: 'a,
+{
+    pub fn new<T, V>(
+        position: Point,
+        viewport: Rectangle,
+        menu: Menu<'a, 'b, T, V, Message, Theme, Renderer>,
+        target_height: f32,
+        menu_height: Length,
+    ) -> Self
+    where
+        T: Clone + ToString + PartialEq,
+        V: Borrow<T> + 'a,
+    {
+        let Menu {
+            state,
+            options,
+            symbols,
+            optional,
+            none_label,
+            none_separator,
+            exclusion_mode,
+            hovered_option,
+            selection,
+            on_selected,
+            on_option_hovered,
+            width,
+            padding,
+            font,
+            symbols_font,
+            text_size,
+            text_line_height,
+            class,
+        } = menu;
+
+        let list = Scrollable::new(List {
+            options,
+            symbols,
+            optional,
+            none_label,
+            none_separator,
+            exclusion_mode,
+            hovered_option,
+            selection,
+            on_selected,
+            on_option_hovered,
+            font,
+            symbols_font,
+            text_size,
+            text_line_height,
+            padding,
+            class,
+        })
+        .height(menu_height);
+
+        state.tree.diff(&list as &dyn Widget<_, _, _>);
+
+        Self {
+            position,
+            viewport,
+            tree: &mut state.tree,
+            list,
+            width,
+            target_height,
+            class,
+        }
+    }
+}
+
+impl<Message, Theme, Renderer> iced_core::Overlay<Message, Theme, Renderer>
+    for Overlay<'_, '_, Message, Theme, Renderer>
+where
+    Theme: Catalog,
+    Renderer: text::Renderer,
+{
+    fn layout(&mut self, renderer: &Renderer, bounds: Size) -> layout::Node {
+        let space_below = bounds.height - (self.position.y + self.target_height);
+        let space_above = self.position.y;
+
+        let limits = layout::Limits::new(
+            Size::ZERO,
+            Size::new(
+                bounds.width - self.position.x,
+                if space_below > space_above {
+                    space_below
+                } else {
+                    space_above
+                },
+            ),
+        )
+        .width(self.width);
+
+        let node = self.list.layout(self.tree, renderer, &limits);
+        let size = node.size();
+
+        node.move_to(if space_below > space_above {
+            self.position + Vector::new(0.0, self.target_height)
+        } else {
+            self.position - Vector::new(0.0, size.height)
+        })
+    }
+
+    fn update(
+        &mut self,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+    ) {
+        let bounds = layout.bounds();
+
+        self.list.update(
+            self.tree, event, layout, cursor, renderer, clipboard, shell, &bounds,
+        )
+    }
+
+    fn mouse_interaction(
+        &self,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &Renderer,
+    ) -> mouse::Interaction {
+        self.list
+            .mouse_interaction(self.tree, layout, cursor, &self.viewport, renderer)
+    }
+
+    fn draw(
+        &self,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        defaults: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+    ) {
+        let bounds = layout.bounds();
+
+        let style = Catalog::style(theme, self.class);
+
+        renderer.fill_quad(
+            renderer::Quad {
+                bounds,
+                border: style.border,
+                shadow: style.shadow,
+                ..renderer::Quad::default()
+            },
+            style.background,
+        );
+
+        self.list.draw(
+            self.tree, renderer, theme, defaults, layout, cursor, &bounds,
+        );
+    }
+}
+
+struct List<'a, 'b, T, V, Message, Theme, Renderer>
+where
+    Theme: Catalog,
+    Renderer: text::Renderer,
+{
+    options: &'a [T],
+    symbols: [&'a str; 3],
+    optional: bool,
+    none_label: &'a String,
+    none_separator: bool,
+    exclusion_mode: bool,
+    hovered_option: &'a mut Option<usize>,
+    selection: &'a Vec<(Option<V>, SelectionState)>,
+    on_selected: Box<dyn FnMut((Option<T>, SelectionState)) -> Message + 'a>,
+    on_option_hovered: Option<&'a dyn Fn(Option<T>) -> Message>,
+    padding: Padding,
+    text_size: Option<Pixels>,
+    text_line_height: text::LineHeight,
+    font: Option<Renderer::Font>,
+    symbols_font: Option<Renderer::Font>,
+    class: &'a <Theme as Catalog>::Class<'b>,
+}
+
+struct ListState {
+    is_hovered: Option<bool>,
+}
+
+impl<T, V, Message, Theme, Renderer> Widget<Message, Theme, Renderer>
+    for List<'_, '_, T, V, Message, Theme, Renderer>
+where
+    T: Clone + ToString + PartialEq,
+    V: Borrow<T>,
+    Theme: Catalog,
+    Renderer: text::Renderer,
+{
+    fn state(&self) -> tree::State {
+        tree::State::new(ListState { is_hovered: None })
+    }
+
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<Option<bool>>()
+    }
+
+    fn size(&self) -> Size<Length> {
+        Size {
+            width: Length::Fill,
+            height: Length::Shrink,
+        }
+    }
+
+    fn layout(
+        &mut self,
+        _tree: &mut Tree,
+        renderer: &Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        use std::f32;
+
+        let text_size = self.text_size.unwrap_or_else(|| renderer.default_size());
+
+        let text_line_height = self.text_line_height.to_absolute(text_size);
+
+        let size = {
+            let intrinsic = Size::new(
+                0.0,
+                (f32::from(text_line_height) + self.padding.y())
+                    * (self.options.len() as f32 + if self.optional { 1.0 } else { 0.0 }),
+            );
+
+            limits.resolve(Length::Fill, Length::Shrink, intrinsic)
+        };
+
+        layout::Node::new(size)
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &Renderer,
+        _clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        _viewport: &Rectangle,
+    ) {
+        match event {
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                if cursor.is_over(layout.bounds())
+                    && let Some(index) = *self.hovered_option
+                {
+                    self.handle_option_selection(index, shell);
+                    shell.capture_event();
+                }
+            }
+            Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                if let Some(cursor_position) = cursor.position_in(layout.bounds()) {
+                    let text_size = self.text_size.unwrap_or_else(|| renderer.default_size());
+
+                    let option_height =
+                        f32::from(self.text_line_height.to_absolute(text_size)) + self.padding.y();
+
+                    let new_hovered_option = (cursor_position.y / option_height) as usize;
+
+                    if *self.hovered_option != Some(new_hovered_option) {
+                        if let Some(on_option_hovered) = self.on_option_hovered {
+                            let hovered_value = if self.optional && new_hovered_option == 0 {
+                                None
+                            } else {
+                                self.options
+                                    .get(new_hovered_option - if self.optional { 1 } else { 0 })
+                                    .cloned()
+                            };
+
+                            shell.publish(on_option_hovered(hovered_value));
+                        }
+
+                        shell.request_redraw();
+                    }
+
+                    *self.hovered_option = Some(new_hovered_option);
+                }
+            }
+            Event::Touch(touch::Event::FingerPressed { .. }) => {
+                if let Some(cursor_position) = cursor.position_in(layout.bounds()) {
+                    let text_size = self.text_size.unwrap_or_else(|| renderer.default_size());
+
+                    let option_height =
+                        f32::from(self.text_line_height.to_absolute(text_size)) + self.padding.y();
+
+                    *self.hovered_option = Some((cursor_position.y / option_height) as usize);
+
+                    if let Some(index) = *self.hovered_option {
+                        self.handle_option_selection(index, shell);
+                        shell.capture_event();
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        let state = tree.state.downcast_mut::<ListState>();
+
+        if let Event::Window(window::Event::RedrawRequested(_now)) = event {
+            state.is_hovered = Some(cursor.is_over(layout.bounds()));
+        } else if state
+            .is_hovered
+            .is_some_and(|is_hovered| is_hovered != cursor.is_over(layout.bounds()))
+        {
+            shell.request_redraw();
+        }
+    }
+
+    fn mouse_interaction(
+        &self,
+        _state: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        _viewport: &Rectangle,
+        _renderer: &Renderer,
+    ) -> mouse::Interaction {
+        let is_mouse_over = cursor.is_over(layout.bounds());
+
+        if is_mouse_over {
+            mouse::Interaction::Pointer
+        } else {
+            mouse::Interaction::default()
+        }
+    }
+
+    fn draw(
+        &self,
+        _state: &Tree,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        _style: &renderer::Style,
+        layout: Layout<'_>,
+        _cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        let style = Catalog::style(theme, self.class);
+        let bounds = layout.bounds();
+
+        let text_size = self.text_size.unwrap_or_else(|| renderer.default_size());
+        let option_height =
+            f32::from(self.text_line_height.to_absolute(text_size)) + self.padding.y();
+
+        let offset = viewport.y - bounds.y;
+        let mut start = (offset / option_height) as usize;
+        let end = ((offset + viewport.height) / option_height).ceil() as usize;
+
+        let visible_options = &self.options[start..end.min(self.options.len())];
+
+        let mut offset_y = 0.0;
+
+        if self.optional {
+            let selection_state = self
+                .selection
+                .iter()
+                .find(|(item, _)| item.is_none())
+                .map(|(_, state)| *state)
+                .unwrap_or(SelectionState::Unselected);
+
+            self.draw_option(
+                start,
+                renderer,
+                &bounds,
+                offset_y,
+                viewport,
+                option_height,
+                text_size,
+                &style,
+                self.none_label.to_string(),
+                selection_state,
+            );
+            start += 1;
+
+            if self.none_separator {
+                let separator_bounds = {
+                    Rectangle {
+                        x: bounds.x,
+                        y: bounds.y + option_height,
+                        width: bounds.width,
+                        height: 1.0_f32,
+                    }
+                };
+
+                renderer.fill_quad(
+                    renderer::Quad {
+                        bounds: separator_bounds,
+                        border: border::rounded(0.0),
+                        ..renderer::Quad::default()
+                    },
+                    style.text_color.scale_alpha(0.3),
+                );
+
+                offset_y = 1.0;
+            }
+        }
+
+        for (i, option) in visible_options.iter().enumerate() {
+            let i = start + i;
+
+            let selection_state = self
+                .selection
+                .iter()
+                .find(|(item, _)| item.as_ref().map(Borrow::borrow) == Some(option))
+                .map(|(_, state)| *state)
+                .unwrap_or(SelectionState::Unselected);
+
+            self.draw_option(
+                i,
+                renderer,
+                &bounds,
+                offset_y,
+                viewport,
+                option_height,
+                text_size,
+                &style,
+                option.to_string(),
+                selection_state,
+            );
+        }
+    }
+}
+
+impl<'a, T, V, Message, Theme, Renderer> List<'a, '_, T, V, Message, Theme, Renderer>
+where
+    T: Clone + ToString + PartialEq,
+    V: Borrow<T> + 'a,
+    Theme: Catalog,
+    Renderer: text::Renderer,
+{
+    fn handle_option_selection(&mut self, index: usize, shell: &mut Shell<'_, Message>) {
+        let option = if self.optional && index == 0 {
+            None
+        } else {
+            self.options.get(index - self.optional as usize).cloned()
+        };
+
+        let selected = if let Some(option) = option.as_ref() {
+            self.selection
+                .iter()
+                .find(|(item, _)| item.as_ref().map(Borrow::borrow) == Some(option))
+        } else {
+            self.selection.iter().find(|(item, _)| item.is_none())
+        };
+
+        if let Some((_, current_state)) = selected {
+            let new_state = match current_state {
+                SelectionState::Excluded => SelectionState::Unselected,
+                SelectionState::Included => {
+                    if self.exclusion_mode {
+                        SelectionState::Excluded
+                    } else {
+                        SelectionState::Unselected
+                    }
+                }
+                SelectionState::Unselected => SelectionState::Included,
+            };
+
+            shell.publish((self.on_selected)((option, new_state)));
+        } else {
+            shell.publish((self.on_selected)((option, SelectionState::Included)));
+        }
+    }
+
+    fn draw_option(
+        &self,
+        index: usize,
+        renderer: &mut Renderer,
+        bounds: &Rectangle,
+        offset_y: f32,
+        viewport: &Rectangle,
+        option_height: f32,
+        text_size: Pixels,
+        style: &Style,
+        content: String,
+        selection_state: SelectionState,
+    ) {
+        let is_selected = *self.hovered_option == Some(index);
+
+        let bounds = Rectangle {
+            x: bounds.x,
+            y: bounds.y + (option_height * index as f32) + offset_y,
+            width: bounds.width,
+            height: option_height,
+        };
+
+        if is_selected {
+            renderer.fill_quad(
+                renderer::Quad {
+                    bounds: Rectangle {
+                        x: bounds.x + style.border.width,
+                        width: bounds.width - style.border.width * 2.0,
+                        ..bounds
+                    },
+                    border: border::rounded(style.border.radius),
+                    ..renderer::Quad::default()
+                },
+                style.selected_background,
+            );
+        }
+
+        let state_text = Text {
+            content: match selection_state {
+                SelectionState::Unselected => self.symbols[0],
+                SelectionState::Included => self.symbols[1],
+                SelectionState::Excluded => self.symbols[2],
+            }
+            .to_owned(),
+            bounds: Size::new(f32::INFINITY, bounds.height),
+            size: text_size,
+            line_height: self.text_line_height,
+            font: self.symbols_font.unwrap_or_else(|| renderer.default_font()),
+            align_x: text::Alignment::Left,
+            align_y: alignment::Vertical::Center,
+            shaping: text::Shaping::Advanced,
+            wrapping: text::Wrapping::default(),
+        };
+
+        renderer.fill_text(
+            state_text,
+            Point::new(bounds.x + self.padding.left, bounds.center_y()),
+            if is_selected {
+                style.selected_text_color
+            } else {
+                style.text_color
+            },
+            *viewport,
+        );
+
+        renderer.fill_text(
+            Text {
+                content,
+                bounds: Size::new(f32::INFINITY, bounds.height),
+                size: text_size,
+                line_height: self.text_line_height,
+                font: self.font.unwrap_or_else(|| renderer.default_font()),
+                align_x: text::Alignment::Left,
+                align_y: alignment::Vertical::Center,
+                shaping: text::Shaping::Advanced,
+                wrapping: text::Wrapping::default(),
+            },
+            Point::new(
+                text_size.0 + bounds.x + self.padding.left,
+                bounds.center_y(),
+            ),
+            if is_selected {
+                style.selected_text_color
+            } else {
+                style.text_color
+            },
+            *viewport,
+        );
+    }
+}
+
+impl<'a, 'b, T, V, Message, Theme, Renderer> From<List<'a, 'b, T, V, Message, Theme, Renderer>>
+    for Element<'a, Message, Theme, Renderer>
+where
+    T: ToString + PartialEq + Clone,
+    V: Borrow<T> + 'a,
+    Message: 'a,
+    Theme: 'a + Catalog,
+    Renderer: 'a + text::Renderer,
+    'b: 'a,
+{
+    fn from(list: List<'a, 'b, T, V, Message, Theme, Renderer>) -> Self {
+        Element::new(list)
+    }
+}
+
+/// The appearance of a [`Menu`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Style {
+    /// The [`Background`] of the menu.
+    pub background: Background,
+    /// The [`Border`] of the menu.
+    pub border: Border,
+    /// The text [`Color`] of the menu.
+    pub text_color: Color,
+    /// The text [`Color`] of a selected option in the menu.
+    pub selected_text_color: Color,
+    /// The background [`Color`] of a selected option in the menu.
+    pub selected_background: Background,
+    /// The [`Shadow`] of the menu.
+    pub shadow: Shadow,
+}
+
+/// The theme catalog of a [`Menu`].
+pub trait Catalog: scrollable::Catalog {
+    /// The item class of the [`Catalog`].
+    type Class<'a>;
+
+    /// The default class produced by the [`Catalog`].
+    fn default<'a>() -> <Self as Catalog>::Class<'a>;
+
+    /// The default class for the scrollable of the [`Menu`].
+    fn default_scrollable<'a>() -> <Self as scrollable::Catalog>::Class<'a> {
+        <Self as scrollable::Catalog>::default()
+    }
+
+    /// The [`Style`] of a class with the given status.
+    fn style(&self, class: &<Self as Catalog>::Class<'_>) -> Style;
+}
+
+/// A styling function for a [`Menu`].
+pub type StyleFn<'a, Theme> = Box<dyn Fn(&Theme) -> Style + 'a>;
+
+impl Catalog for Theme {
+    type Class<'a> = StyleFn<'a, Self>;
+
+    fn default<'a>() -> StyleFn<'a, Self> {
+        Box::new(default)
+    }
+
+    fn style(&self, class: &StyleFn<'_, Self>) -> Style {
+        class(self)
+    }
+}
+
+/// The default style of the list of a [`Menu`].
+pub fn default(theme: &Theme) -> Style {
+    let palette = theme.extended_palette();
+
+    Style {
+        background: palette.background.weak.color.into(),
+        border: Border {
+            width: 1.0,
+            radius: 0.0.into(),
+            color: palette.background.strong.color,
+        },
+        text_color: palette.background.weak.text,
+        selected_text_color: palette.primary.strong.text,
+        selected_background: palette.primary.strong.color.into(),
+        shadow: Shadow::default(),
+    }
+}

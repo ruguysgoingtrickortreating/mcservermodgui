@@ -1,0 +1,85 @@
+[package]
+name = "iced_widget_extra"
+version = "0.15.0-dev"
+edition = "2024"
+authors = ["mytdragon <mytdragon@protonmail.com>"]
+description = "A collection of iced's widgets slightly modified"
+license = "MIT"
+repository = "https://gitlab.com/mytdragon/iced_widget_extra"
+keywords = ["gui", "iced", "widget"]
+categories = ["gui"]
+readme = "README.md"
+
+[features]
+default = ["crisp"]
+
+action_area = []
+pair_grid = []
+pick_list_multi = []
+pick_list_option = []
+table = []
+text_editor = []
+text_input = []
+
+full = [
+    "action_area",
+    "pair_grid",
+    "pick_list_multi",
+    "pick_list_option",
+    "table",
+    "text_editor",
+    "text_input",
+]
+
+advanced = ["iced_core/advanced"]
+basic-shaping = ["iced_core/basic-shaping"]
+advanced-shaping = ["iced_core/advanced-shaping"]
+crisp = ["iced_core/crisp", "iced_widget/crisp"]
+highlighter = ["iced_highlighter"]
+
+[dependencies]
+iced_core = "0.14.0"
+iced_highlighter = { version = "0.14.0", optional = true }
+iced_renderer = "0.14.0"
+iced_runtime = "0.14.0"
+iced_widget = "0.14.0"
+
+unicode-segmentation = "1.0"
+
+[dev-dependencies]
+iced = "0.14.0"
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints.clippy]
+too-many-arguments = "allow"
+type-complexity = "allow"
+
+[[example]]
+name = "action_area"
+required-features = ["action_area", "text_input"]
+
+[[example]]
+name = "pair_grid"
+required-features = ["pair_grid"]
+
+[[example]]
+name = "pick_list_multi"
+required-features = ["pick_list_multi"]
+
+[[example]]
+name = "pick_list_option"
+required-features = ["pick_list_option"]
+
+[[example]]
+name = "table"
+required-features = ["table"]
+
+[[example]]
+name = "text_editor"
+required-features = ["text_editor"]
+
+[[example]]
+name = "text_input"
+required-features = ["text_input"]

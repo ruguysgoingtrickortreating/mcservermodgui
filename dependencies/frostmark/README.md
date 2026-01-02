@@ -4,7 +4,7 @@
 
 Render rich text in your `iced` app at lightning-fast speeds using plain HTML or Markdown!
 
-![Demo showing HTML and Markdown together](./examples/assets/live_edit.png)
+![Demo showing HTML and Markdown together](examples/assets/live_edit.png)
 
 ---
 

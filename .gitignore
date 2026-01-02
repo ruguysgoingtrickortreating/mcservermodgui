@@ -1,5 +1,6 @@
 /target
 /.mcservermodgui
+/.idea
 
-/frostmark/debug
-/frostmark/target
+/dependencies/frostmark/debug
+/dependencies/frostmark/target

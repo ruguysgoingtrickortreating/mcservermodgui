@@ -9,7 +9,7 @@ use iced::{
 };
 use zip::{ZipArchive, result::ZipError};
 
-use crate::{Message, MinecraftVersion, ModLoader, ProgramData, REQ_CLIENT, util::circular};
+use crate::{Message, MinecraftVersion, ModLoader, ProgramData, REQ_CLIENT, util::circular, MC_VERSIONS};
 
 struct PistonMetaResponse {}
 
@@ -58,7 +58,7 @@ pub struct InitState {
     pub versions_list: Option<VersionsList>,
     pub assumed_name: String,
     pub assumed_loader: Option<ModLoader>,
-    pub assumed_version: Option<String>,
+    pub assumed_version: Option<MinecraftVersion>,
 }
 impl InitState {
     pub fn update(&mut self, _message: InitMessage) -> Task<InitMessage> {
@@ -77,6 +77,7 @@ impl InitState {
                     self.phase = InitPhase::FetchingVersions;
                     return Task::perform(_get_minecraft_versions(), InitMessage::VersionsReceived);
                 } else {
+                    self._assume_program_data();
                     self.phase = InitPhase::Concluded;
                     return Task::done(InitMessage::InitConcluded);
                 }
@@ -114,7 +115,8 @@ impl InitState {
                 )
                 .unwrap();
                 self.versions_list = Some(result);
-
+                
+                self._assume_program_data();
                 self.phase = InitPhase::Concluded;
                 return Task::done(InitMessage::InitConcluded);
             },
@@ -176,8 +178,6 @@ impl InitState {
                 let b = fs::read(d).unwrap();
                 let result: Result<ProgramData, _> = toml::from_slice(&b);
                 self.program_data = Some(result.unwrap());
-            } else { // ASSUME MOD LOADERS
-                self._make_an_ass_out_of_you_and_me();
             }
             let v = m.join("minecraft_versions_list_cache.json");
             if Path::is_file(&v) {
@@ -198,7 +198,6 @@ impl InitState {
             }
         } else {
             self.phase = InitPhase::CheckingFiles;
-            self._make_an_ass_out_of_you_and_me();
             fs::create_dir(m)
                 .map_err(|e| panic!("error in directory creation: {e}"))
                 .unwrap();
@@ -206,9 +205,9 @@ impl InitState {
         }
     }
 
-    fn _make_an_ass_out_of_you_and_me(&mut self) {
+    fn _assume_program_data(&mut self) {
         self.assumed_name = self.current_path.file_name().expect("CRITICAL: COULDN'T ACCESS PARENT FOLDER").to_string_lossy().to_owned().to_string();
-        let loader:ModLoader = 
+        let loader:ModLoader =
         if Path::is_dir(&self.current_path.join("plugins")) {
             if Path::is_dir(&self.current_path.join("libraries").join("dev").join("folia")) {
                 ModLoader::Folia
@@ -246,7 +245,9 @@ impl InitState {
             Err(e) => return
         };
         let Some(folder) = r.next() else {return};
-        self.assumed_version = Some(folder.unwrap().file_name().to_string_lossy().into_owned());
+        let ver = folder.unwrap().file_name().to_string_lossy().into_owned();
+        let found = self.versions_list.as_ref().unwrap().versions.iter().find(|v| *v.id == ver).cloned();
+        self.assumed_version = found;
     }
 }
 

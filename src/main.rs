@@ -1,7 +1,10 @@
 use core::fmt;
 use std::{cell::OnceCell, collections::HashMap, sync::{Arc, LazyLock, OnceLock}};
-
+use std::cell::RefCell;
+use std::fmt::{Display, Formatter};
+use std::sync::RwLock;
 use iced::{Color, Element, Task, advanced::{image::Handle as RasterHandle, svg::Handle as SvgHandle}, widget::{button, checkbox, column, pick_list}, window};
+use iced::advanced::svg::Svg;
 use reqwest::Client;
 
 mod states;
@@ -18,39 +21,80 @@ use crate::states::{init::InitMessage, main_window::MainMessage};
 struct _StaticImages {
     missing: RasterHandle,
     unknown: RasterHandle,
+
+    file: SvgHandle,
+    filter: SvgHandle,
+
     modrinth: SvgHandle,
     curseforge: SvgHandle,
     hangar: SvgHandle,
-    file: SvgHandle
+
+    fabric: SvgHandle,
+    neoforge: SvgHandle,
+    forge: SvgHandle,
+    paper: SvgHandle,
+    purpur: SvgHandle,
+    folia: SvgHandle,
+    velocity: SvgHandle,
+    unknown_loader: SvgHandle,
 }
 
+static MC_VERSIONS: OnceLock<Vec<MinecraftVersion>> = OnceLock::new();
+static PROGRAM_DATA: RwLock<Option<ProgramData>> = RwLock::new(None);
 static REQ_CLIENT: LazyLock<Client> = LazyLock::new(|| Client::new());
 static STATIC_IMAGES: LazyLock<_StaticImages> = LazyLock::new(|| _StaticImages {
     missing: RasterHandle::from_bytes(include_bytes!("../assets/missing_image.png").to_vec()),
     unknown: RasterHandle::from_bytes(include_bytes!("../assets/unknown_image.png").to_vec()),
+
+    file: SvgHandle::from_memory(include_bytes!("../assets/folder.svg")),
+    filter: SvgHandle::from_memory(include_bytes!("../assets/filter.svg")),
+
     modrinth: SvgHandle::from_memory(include_bytes!("../assets/modrinth.svg")),
     curseforge: SvgHandle::from_memory(include_bytes!("../assets/curseforge.svg")),
     hangar: SvgHandle::from_memory(include_bytes!("../assets/hangar.svg")),
-    file: SvgHandle::from_memory(include_bytes!("../assets/folder.svg")),
+
+    fabric: SvgHandle::from_memory(include_bytes!("../assets/fabric.svg")),
+    neoforge: SvgHandle::from_memory(include_bytes!("../assets/neoforge.svg")),
+    forge: SvgHandle::from_memory(include_bytes!("../assets/forge.svg")),
+    paper: SvgHandle::from_memory(include_bytes!("../assets/paper.svg")),
+    purpur: SvgHandle::from_memory(include_bytes!("../assets/purpur.svg")),
+    folia: SvgHandle::from_memory(include_bytes!("../assets/folia.svg")),
+    velocity: SvgHandle::from_memory(include_bytes!("../assets/velocity.svg")),
+    unknown_loader: SvgHandle::from_memory(include_bytes!("../assets/unknown_loader.svg")),
 });
 
+static SVG_MOD_LOADERS: LazyLock<[Svg;8]> = LazyLock::new(|| [
+    Svg::new(STATIC_IMAGES.unknown_loader.clone()),
+    Svg::new(STATIC_IMAGES.fabric.clone()),
+    Svg::new(STATIC_IMAGES.neoforge.clone()),
+    Svg::new(STATIC_IMAGES.forge.clone()),
+    Svg::new(STATIC_IMAGES.paper.clone()),
+    Svg::new(STATIC_IMAGES.purpur.clone()),
+    Svg::new(STATIC_IMAGES.folia.clone()),
+    Svg::new(STATIC_IMAGES.velocity.clone()),
+]);
 
 #[derive(serde::Serialize,serde::Deserialize,Debug)]
 struct ProgramData {
     name: String,
     loader: ModLoader,
-    version: String,
+    version: MinecraftVersion,
 }
 
 
-#[derive(serde::Serialize,serde::Deserialize, Debug)]
+#[derive(serde::Serialize,serde::Deserialize, Debug, PartialEq, Clone)]
 struct MinecraftVersion {
     id: String,
     #[serde(rename="type",deserialize_with="_version_kind_handler")]
     kind: VersionKind
 }
+impl Display for MinecraftVersion {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.id.to_string())
+    }
+}
 
-#[derive(serde::Serialize,serde::Deserialize,strum_macros::Display,strum_macros::VariantArray,Clone, Copy, PartialEq, Debug)]
+#[derive(serde::Serialize,serde::Deserialize,strum_macros::Display,strum_macros::VariantArray, Clone, Copy, PartialEq, Debug)]
 enum ModLoader {
     Fabric,
     NeoForge,
@@ -61,7 +105,7 @@ enum ModLoader {
     Velocity,
 }
 
-#[derive(serde::Serialize,Debug)]
+#[derive(serde::Serialize,Debug,Clone,PartialEq)]
 enum VersionKind {
     Release,
     Snapshot,
@@ -121,7 +165,6 @@ struct AppState {
     init_state: Option<InitState>,
     setup_state: Option<SetupState>,
     main_state: Option<MainState>,
-    mod_downloader_state: Option<ModDownloaderState>,
 }
 impl AppState {
     fn update(&mut self, _message:Message) -> Task<Message> {
@@ -133,11 +176,12 @@ impl AppState {
                 let settings = window::Settings::default();
                 match win_type {
                     WindowType::ModDownload => {
-                        if self.mod_downloader_state.is_some() {panic!("Tried to open ModDownloader window while ModDownloader state already exists")};
+                        let Some(main_state) = self.main_state.as_mut() else {panic!("Had ModDownloader window without corresponding main window")};
+                        if main_state.mod_downloader_state.is_some() {panic!("Tried to open ModDownloader window while ModDownloader state already exists")};
 
-                        let mut state = ModDownloaderState::default();
-                        task = state.init();
-                        self.mod_downloader_state = Some(state);
+                        let (state,t) = ModDownloaderState::new(&main_state.program_data);
+                        task = t;
+                        main_state.mod_downloader_state = Some(state);
                     }
                     WindowType::Init => {
                         if self.init_state.is_some() {panic!("Tried to open Init window while Init state already exists")};
@@ -170,7 +214,9 @@ impl AppState {
                 let w = self.windows.remove(&id).unwrap();
                 match w.window_type {
                     WindowType::ModDownload => {
-                        self.mod_downloader_state = None;
+                        let Some(main_state) = self.main_state.as_mut() else {panic!("Had ModDownloader window without corresponding main window")};
+
+                        main_state.mod_downloader_state = None;
                     }
                     _ => {
                         return iced::exit();
@@ -188,19 +234,19 @@ impl AppState {
 
                     if let Some(program_data) = state.program_data.take() {
                         kind = WindowType::Main;
-                        let main = MainState::new(program_data,versions);
+                        let main = MainState::new(program_data);
                         self.main_state = Some(main);
                     } else {
                         kind = WindowType::Setup;
                         let mut setup = SetupState::default();
-                        if let Some(v) = &state.assumed_version && versions.iter().find(|s| &s.id == v).is_some() {
+                        if let Some(v) = &state.assumed_version && versions.iter().find(|s| *s == v).is_some() {
                             setup.selected_version = state.assumed_version;
                         }
                         setup.name = state.assumed_name;
-                        setup.mc_versions = versions;
                         setup.selected_loader = state.assumed_loader;
                         self.setup_state = Some(setup);
                     }
+                    MC_VERSIONS.set(versions).expect("versions already set on init");
                     self.windows.insert(id, Window{window_type: kind});
                     // return Task::batch([window::close(id),Task::done(Message::OpenWindow(kind))]);
                     return Task::none()
@@ -212,9 +258,8 @@ impl AppState {
                 if let SetupMessage::SetupConcluded = m {
                     let id = self.windows.iter().find_map(|(&id,w)| if w.window_type == WindowType::Setup {Some(id)} else {None}).expect("tried to close an Setup window that didn't exist");   
                     let mut state = self.setup_state.take().unwrap();
-                    let versions = state.mc_versions;
 
-                    let main = MainState::new(state.program_data.take().expect("received unfinished program data"),versions);
+                    let main = MainState::new(state.program_data.take().expect("received unfinished program data"));
                     self.main_state = Some(main);
                     self.windows.insert(id, Window{window_type: WindowType::Main});
                     return Task::none();
@@ -222,7 +267,7 @@ impl AppState {
                 return self.setup_state.as_mut().unwrap().update(m)
             }
             Message::MainMessage(m) => return self.main_state.as_mut().unwrap().update(m),
-            Message::ModDLMessage(m)  => return self.mod_downloader_state.as_mut().unwrap().update(m),
+            Message::ModDLMessage(m)  => return self.main_state.as_mut().unwrap().mod_downloader_state.as_mut().unwrap().update(m),
         }
         Task::none()
     }
@@ -232,16 +277,16 @@ impl AppState {
         WindowType::Init => self.init_state.as_ref().unwrap().view().map(|v| Message::InitMessage(v)),
         WindowType::Setup => self.setup_state.as_ref().unwrap().view().map(|v| Message::SetupMessage(v)),
         WindowType::Main => self.main_state.as_ref().unwrap().view().map(|v| Message::MainMessage(v)),
-        WindowType::ModDownload => self.mod_downloader_state.as_ref().unwrap().view().map(|v| Message::ModDLMessage(v)),
+        WindowType::ModDownload => self.main_state.as_ref().unwrap().mod_downloader_state.as_ref().unwrap().view().map(|v| Message::ModDLMessage(v)),
     }     
     }
 }
 
-pub enum ProgramPhase {
-    Init(InitState),
-    Setup(SetupState),
-    Main(MainState)
-}
+// pub enum ProgramPhase {
+//     Init(InitState),
+//     Setup(SetupState),
+//     Main(MainState)
+// }
 
 #[derive(Debug,Clone,Copy,PartialEq)]
 pub enum WindowType {
