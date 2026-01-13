@@ -409,7 +409,7 @@ where
                     Size::new(icon_size, icon_size).into()
                 );
                 renderer.draw_svg(
-                    svg.clone().color(Color::WHITE),
+                    svg.clone().color(style.text_color),
                     icon_bounds,
                     icon_bounds,
                 );

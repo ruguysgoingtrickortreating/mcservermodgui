@@ -3,56 +3,110 @@ use std::{
     f32::consts::PI,
 };
 use std::fmt::Display;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use frostmark::{MarkState, MarkWidget};
 use iced::{Color, Element, Radians, Task, advanced::{image::Handle as RasterHandle, svg::Handle as SvgHandle}, gradient::Linear, widget::{
     self, button, column, container, row, scrollable, checkbox, image, mouse_area, space, stack, svg, Button,
     scrollable::Viewport,
     text, text_input,
 }, border, mouse, Border, Font, font};
+use iced::theme::palette::deviate;
 use iced::widget::scrollable::Scrollbar;
-use iced::widget::tooltip;
+use iced::widget::{center, hover, opaque, rich_text, right, rule, span, tooltip};
+use iced::widget::button::Status;
 use iced_widget_extra::pick_list_multi;
 use iced_widget_extra::pick_list_multi::{update_selection, SelectionState};
+use iced_selection;
 use itertools::Itertools;
+use rs_abbreviation_number::{AbbreviationOptions, NumericAbbreviate};
 use serde::Deserialize;
 use smart_default::{self, SmartDefault};
 use strum::VariantArray;
-use crate::{ImageType, STATIC_IMAGES, Message::{self, ModDLMessage as SuperMsg}, reqwests, MinecraftVersion, MC_VERSIONS, ProgramData, ModLoader, SVG_MOD_LOADERS};
-use crate::util::icon_pick_list;
-use crate::util::icon_pick_list::{icon_pick_list, Catalog};
+use crate::{ImageType, STATIC_IMAGES, Message::{self, ModDLMessage as SuperMsg}, reqwests, MinecraftVersion, MC_VERSIONS, ProgramData, ModLoader, SVG_MOD_LOADERS, VersionKind, WindowType, bold, ModProvider};
+use crate::util::{circular,icon_pick_list::{self, icon_pick_list, Catalog}};
+
+mod modrinth;
 
 #[derive(Debug, Clone)]
 pub enum ModDownMsg {
     OpenLink(String),
+    CloseRequested,
 
     ImageDownloaded(Result<reqwests::ImageData, String>),
     ModsSearchReceived(Result<Vec<u8>, String>),
     ModReceived(Result<Vec<u8>, String>),
     ModVersionsReceived(Result<(String, Vec<u8>), String>),
+    DownloadVersionsReceived(Result<Vec<u8>, String>),
+    CategoriesReceived(Result<Vec<u8>, String>),
+
+    ProviderButtonPressed(ModProvider),
+
     ModListingPressed(usize),
     ModsListScrolled(Viewport),
-    SearchTyped(String),
-    SearchSubmitted,
+
     FilterButtonPressed,
     FilterVersionPicked((Option<MinecraftVersion>, SelectionState)),
     FilterLoaderPicked((Option<ModLoader>, SelectionState)),
+    FilterCategoryPicked((Option<String>, SelectionState)),
+    ShowSnapshotsChecked(bool),
     ServerSideModsChecked(bool),
-    DownloadButtonPressed,
+
+    SearchTyped(String),
+    SearchSubmitted,
+    RetrySearchPressed,
+
     ModVersionPicked(ModVersion),
     SelectVersionButtonPressed,
+    SelectedVersionTrashPressed(usize),
+    DownloadButtonPressed,
 
-    None
+    ConfirmCloseButtonPressed,
+    CancelCloseButtonPressed,
+
+    None,
 }
 
-#[derive(SmartDefault)]
+#[derive(Default)]
+enum PopupState {
+    #[default]
+    None,
+    CloseConfirmation,
+    DownloadConfirmation,
+    NetworkError(&'static str, String),
+}
+
+#[derive(Default)]
+enum FetchState {
+    #[default]
+    Done,
+    Fetching,
+    Errored
+}
+
+#[derive(Default)]
+enum DownloadVerState {
+    #[default]
+    Fetching,
+    Done(DownloadVerData)
+}
+
+struct DownloadVerData {
+
+}
+
+#[derive(Default)]
 pub struct ModDownloaderState {
+    popup_state: PopupState,
+
+    current_provider: ModProvider,
+
     markup_state: MarkState,
 
     current_mod: Option<ModInfo>,
     cached_images: HashMap<String, ImageType>,
     cached_mods: HashMap<String, ModrinthMod>,
     images_queued: HashSet<String>,
+    cached_categories: Vec<String>,
 
     selected_mod_versions: Vec<ModVersionQueued>,
 
@@ -62,23 +116,31 @@ pub struct ModDownloaderState {
     mods_search_offset: u64,
 
     show_filter_option: bool,
+    show_snapshots: bool,
     server_sided_mods_only: bool,
     selected_filter_versions: Vec<(Option<MinecraftVersion>, SelectionState)>,
-    selected_filter_loaders: Vec<(Option<ModLoader>,SelectionState)>,
+    selected_filter_loaders: Vec<(Option<ModLoader>, SelectionState)>,
+    selected_filter_categories: Vec<(Option<String>, SelectionState)>,
 
-    // selected_mod_version: ModrinthVersion,
-
-    #[default(_code = "Instant::now()")]
-    time_since_mod_button_clicked: Instant,
+    time_since_mod_button_clicked: Option<Instant>,
     scroll_load_debounce: bool,
-    is_search_fetching: bool,
-    is_mod_fetching: bool,
+    is_search_fetching: FetchState,
+    search_fetching_sequence_number: usize, // used to prevent race conditions where a search is started before another one finishes
+    is_mod_fetching: FetchState,
+    is_download_versions_fetching: FetchState,
 }
 impl ModDownloaderState {
     pub fn update(&mut self, _message: ModDownMsg) -> Task<Message> {
         match _message {
-            ModDownMsg::OpenLink(url) => return Task::done(Message::OpenLink(url)),
             ModDownMsg::None => (),
+            ModDownMsg::OpenLink(url) => return Task::done(Message::OpenLink(url)),
+            ModDownMsg::CloseRequested => {
+                if self.selected_mod_versions.is_empty() {
+                    return Task::done(Message::CloseWindow(WindowType::ModDownload));
+                } else {
+                    self.popup_state = PopupState::CloseConfirmation;
+                }
+            }
 
             ModDownMsg::ImageDownloaded(res) => match res {
                 Ok(img) => {
@@ -98,7 +160,7 @@ impl ModDownloaderState {
             },
             ModDownMsg::ModsSearchReceived(res) => match res {
                 Ok(val) => {
-                    self.is_search_fetching = false;
+                    self.is_search_fetching = FetchState::Done;
                     let des = &mut serde_json::Deserializer::from_slice(&val);
                     let result: Result<ModrinthSearch, _> = serde_path_to_error::deserialize(des);
                     match result {
@@ -127,7 +189,9 @@ impl ModDownloaderState {
                     };
                 }
                 Err(err) => {
+                    self.is_search_fetching = FetchState::Errored;
                     eprintln!("Couldn't get json: {err}");
+                    self.set_popup_state(PopupState::NetworkError("Error searching for mods", err));
                 }
             },
             ModDownMsg::ModVersionsReceived(res) => match res {
@@ -138,7 +202,7 @@ impl ModDownloaderState {
                     if id != current_mod.id {return Task::none()}
 
                     let des = &mut serde_json::Deserializer::from_slice(&val);
-                    let result: Result<Vec<ModrinthVersion>, _> = serde_path_to_error::deserialize(des);
+                    let result: Result<Vec<ModrinthVersionMass>, _> = serde_path_to_error::deserialize(des);
                     match result {
                         Ok(versions) => {
                             let v = versions.into_iter().map(|m| ModVersion {
@@ -156,18 +220,90 @@ impl ModDownloaderState {
                                 }).collect_vec(),
                             }).collect_vec();
                             current_mod.selected_version = v.get(0).map(|m|m.clone());
-                            current_mod.cached_versions = dbg!(v);
+                            current_mod.cached_versions = v;
                         }
                         Err(err) => {
-                            panic!("versions recieved error deserializing {err}")
+                            panic!("versions received error deserializing {err}")
                         }
                     }
                 }
-                Err(err) => {panic!("{err}")}
+                Err(err) => {
+                    eprintln!("Couldn't get categories: {err}");
+                    self.set_popup_state(PopupState::NetworkError("Error getting mod versions", err));
+                }
+            }
+            ModDownMsg::DownloadVersionsReceived(res) => match res {
+                Ok(val) => {
+                    let des = &mut serde_json::Deserializer::from_slice(&val);
+                    let result: Vec<ModrinthVersionDownload> = serde_path_to_error::deserialize(des).expect("error deserializing download versions");
+
+                }
+                Err(err) => {
+                    eprintln!("Couldn't get mod versions for download: {err}");
+                    self.set_popup_state(PopupState::NetworkError("Error getting versions for download", err));
+                }
+            }
+            ModDownMsg::CategoriesReceived(res) => match res {
+                Ok(val) => {
+                    let des = &mut serde_json::Deserializer::from_slice(&val);
+                    let result: Result<Vec<ModrinthCategory>, _> = serde_path_to_error::deserialize(des);
+                    match result {
+                        Ok(categories) => {
+                            self.cached_categories = categories.into_iter().filter_map(|c|
+                                if "mod" == c.project_type {
+                                    Some(c.name)
+                                } else {
+                                    None
+                                }
+                            ).collect()
+                        }
+                        Err(err) => {
+                            panic!("categories received error deserializing {err}")
+                        }
+                    }
+                }
+                Err(err) => {
+                    eprintln!("Couldn't get categories: {err}");
+                    if !matches!(&self.popup_state, PopupState::NetworkError(_,_)) {
+                        self.set_popup_state(PopupState::NetworkError("Error getting mod categories", err));
+                    }
+
+                }
+            }
+            ModDownMsg::ProviderButtonPressed(provider) => {
+                self.current_provider = provider;
             }
             ModDownMsg::ModListingPressed(index) => {
                 let id = self.mods_search_results[index].project_id.clone();
                 if let Some(current_mod) = self.current_mod.as_mut() && id == current_mod.id {
+                    'abort: {
+                        if let Some(timestamp) = self.time_since_mod_button_clicked && timestamp.elapsed() <= Duration::from_millis(300) {
+                            let Some(mod_data) = self.cached_mods.get_mut(&id) else { break 'abort };
+                            if current_mod.is_in_selected_mod_list {
+                                println!("IS IN SELECTED MOD LIST");
+                                let i = self.selected_mod_versions.iter().find_position(|v| v.project_id == current_mod.id).unwrap().0;
+                                self.selected_mod_versions.remove(i);
+                                current_mod.is_in_selected_mod_list = false;
+                                mod_data.is_in_selected_mod_list = false;
+                            } else {
+                                let Some(selected_version) = &current_mod.selected_version else { break 'abort };
+                                current_mod.is_in_selected_mod_list = true;
+                                mod_data.is_in_selected_mod_list = true;
+
+                                self.selected_mod_versions.push(ModVersionQueued {
+                                    icon_url: mod_data.icon_url.clone(),
+                                    project_name: mod_data.title.clone(),
+                                    project_id: mod_data.id.clone(),
+                                    version_name: selected_version.name.clone(),
+                                    version_id: selected_version.id.clone(),
+                                    loaders: selected_version.loaders.clone(),
+                                });
+                            }
+                            self.time_since_mod_button_clicked = None;
+                            return Task::none();
+                        }
+                    }
+                    self.time_since_mod_button_clicked = Some(Instant::now());
                     return Task::none();
                 }
 
@@ -187,7 +323,7 @@ impl ModDownloaderState {
                         id: id.clone(),
                         ..Default::default()
                     });
-                    self.is_mod_fetching = true;
+                    self.is_mod_fetching = FetchState::Fetching;
                     self.markup_state = MarkState::with_html("loading...");
                     return Task::batch([
                         Task::perform(reqwests::fetch_mod(id), ModDownMsg::ModReceived),
@@ -197,9 +333,9 @@ impl ModDownloaderState {
                 }
             }
             ModDownMsg::ModReceived(res) => {
-                self.is_mod_fetching = false;
                 match res {
                     Ok(val) => {
+                        self.is_mod_fetching = FetchState::Done;
                         let des = &mut serde_json::Deserializer::from_slice(&val);
                         let result: Result<ModrinthMod, _> = serde_path_to_error::deserialize(des);
                         match result {
@@ -223,7 +359,9 @@ impl ModDownloaderState {
                         };
                     }
                     Err(err) => {
+                        self.is_mod_fetching = FetchState::Errored;
                         eprintln!("Couldn't get json: {err}");
+                        self.set_popup_state(PopupState::NetworkError("Error fetching mod", err));
                     }
                 }
             },
@@ -251,7 +389,13 @@ impl ModDownloaderState {
                 self.current_query = self.current_searchbar_text.clone();
                 return self._new_mod_search();
             },
+            ModDownMsg::RetrySearchPressed => {
+                return self._new_mod_search();
+            }
             ModDownMsg::FilterButtonPressed => self.show_filter_option = !self.show_filter_option,
+            ModDownMsg::ShowSnapshotsChecked(b) => {
+                self.show_snapshots = b;
+            }
             ModDownMsg::ServerSideModsChecked(b) => {
                 self.server_sided_mods_only = b;
                 return self._new_mod_search();
@@ -264,6 +408,10 @@ impl ModDownloaderState {
                 update_selection(&mut self.selected_filter_loaders, l, s);
                 return self._new_mod_search();
             },
+            ModDownMsg::FilterCategoryPicked((l,s)) => {
+                update_selection(&mut self.selected_filter_categories, l, s);
+                return self._new_mod_search();
+            }
             ModDownMsg::ModVersionPicked(s) => {
                 self.current_mod.as_mut().unwrap().selected_version = Some(s.clone());
             }
@@ -272,8 +420,8 @@ impl ModDownloaderState {
                 let mod_data = self.cached_mods.get_mut(&current_mod.id).unwrap();
                 if current_mod.is_in_selected_mod_list {
                     println!("IS IN SELECTED MOD LIST");
-                    let i = self.selected_mod_versions.iter().find_position(|v| v.project_id == current_mod.id).unwrap();
-                    self.selected_mod_versions.remove(i.0);
+                    let i = self.selected_mod_versions.iter().find_position(|v| v.project_id == current_mod.id).unwrap().0;
+                    self.selected_mod_versions.remove(i);
                     current_mod.is_in_selected_mod_list = false;
                     mod_data.is_in_selected_mod_list = false;
                 } else {
@@ -291,166 +439,255 @@ impl ModDownloaderState {
                     });
                 }
             }
+            ModDownMsg::SelectedVersionTrashPressed(i) => {
+                let version = self.selected_mod_versions.remove(i);
+                if let Some(current_mod) = &mut self.current_mod && current_mod.id == version.project_id {
+                    current_mod.is_in_selected_mod_list = false;
+                };
+                self.cached_mods.get_mut(&version.project_id).unwrap().is_in_selected_mod_list = false;
+            }
             ModDownMsg::DownloadButtonPressed => {
-                let s = self.cached_mods.get(&self.current_mod.as_ref().unwrap().id).unwrap();
+                let t = Task::perform(
+                    reqwests::get_mod_versions(
+                        self.selected_mod_versions.iter().map(|v| format!("\"{}\"",v.version_id)).collect()
+                    ),
+                    ModDownMsg::DownloadVersionsReceived
+                ).map(|m| SuperMsg(m));
+                self.set_popup_state(PopupState::DownloadConfirmation);
+                return t;
+            }
 
-                dbg!(&s);
+            ModDownMsg::ConfirmCloseButtonPressed => {
+                return Task::done(Message::CloseWindow(WindowType::ModDownload));
+            }
+            ModDownMsg::CancelCloseButtonPressed => {
+                self.popup_state = PopupState::None;
             }
         };
         Task::none()
     }
 
     pub fn view(&self) -> Element<'_, ModDownMsg> {
-        let filter_options: Element<_> = if self.show_filter_option {
-            row![
-                pick_list_multi(ModLoader::VARIANTS, &self.selected_filter_loaders, ModDownMsg::FilterLoaderPicked).placeholder("Select Version")
-                    .width(iced::Fill)
-                    .none_label("Pick a version"),
-                pick_list_multi(MC_VERSIONS.get().unwrap().clone(), &self.selected_filter_versions, ModDownMsg::FilterVersionPicked).placeholder("Select Version")
-                    .width(iced::Fill)
-                    .none_label("Pick a version"),
-                checkbox(self.server_sided_mods_only).label("Only show server-sided mods").on_toggle(ModDownMsg::ServerSideModsChecked)
-            ].into()
-        } else {
-            space().into()
-        };
-
-        column![
-            row![
-                text_input("Search...", &self.current_searchbar_text).on_input(|s| ModDownMsg::SearchTyped(s)).on_submit(ModDownMsg::SearchSubmitted).icon(text_input::Icon { font: iced::Font::DEFAULT, code_point: '⌕', size: None, spacing: 4.0, side: text_input::Side::Left }),
-                space().width(5),
-                button(svg(STATIC_IMAGES.filter.clone())).width(30).height(30).padding(4).on_press(ModDownMsg::FilterButtonPressed).style(button::secondary)
-            ].align_y(iced::Center),
-            filter_options,
-            row![
-                scrollable(// mod list
-                    if self.mods_search_results.is_empty() {
-                        if self.is_search_fetching {
-                            iced::Element::from(container("loading...").center(100))
-                        } else {
-                            container("no mods found :(").center(100).into()
-                        }
-                    } else {
-                        column((0..self.mods_search_results.len()).into_iter().map(|i| self._create_mod_listing(i))).spacing(5).into()
+        let view = {
+            let filter = if self.show_snapshots {
+                |m: &&MinecraftVersion| {
+                    match m.kind {
+                        VersionKind::Release | VersionKind::Snapshot => true,
+                        _ => false,
                     }
-                ).width(320).spacing(5).on_scroll(ModDownMsg::ModsListScrolled).id(widget::Id::new("search")),
-                column![scrollable( // markdown section
-                    if let Some(a_mod) = &self.current_mod && let Some(listing) = self.cached_mods.get(&a_mod.id) {
-                        const IMG_SIZE:u32 = 100;
-                        let thumbnail: Element<ModDownMsg> = if let Some(url) = &listing.icon_url {
-                            if let Some(img) = self.cached_images.get(url).cloned() {
-                                match img {
-                                    ImageType::Svg(handle) => svg(handle).width(IMG_SIZE).height(IMG_SIZE).into(),
-                                    ImageType::Raster(handle) => image(handle).width(IMG_SIZE).height(IMG_SIZE).into(),
-                                }
-                            } else {
-                                eprintln!("Image not found in cache for search builder! Creating default image");
-                                image(&STATIC_IMAGES.missing).width(IMG_SIZE).height(IMG_SIZE).into()
+                }
+            } else {
+                |m: &&MinecraftVersion| {
+                    if let VersionKind::Release = m.kind {true} else {false}
+                }
+            };
+            let filter_options: Element<_> = if self.show_filter_option {
+                column![
+                    row![
+                        pick_list_multi(MC_VERSIONS.get().unwrap().iter().filter(filter).cloned().collect_vec(), &self.selected_filter_versions, ModDownMsg::FilterVersionPicked)
+                            .placeholder("showing all versions..")
+                            .width(iced::Fill),
+                        pick_list_multi(ModLoader::VARIANTS, &self.selected_filter_loaders, ModDownMsg::FilterLoaderPicked)
+                            .placeholder("showing all loaders..")
+                            .width(iced::Fill),
+                        pick_list_multi(self.cached_categories.clone(), &self.selected_filter_categories, ModDownMsg::FilterCategoryPicked)
+                            .placeholder("showing all categories..")
+                            .width(iced::Fill)
+                    ].spacing(5),
+                    row![
+                        checkbox(self.show_snapshots).label("List Snapshots⤴").on_toggle(ModDownMsg::ShowSnapshotsChecked).width(iced::Fill),
+                        checkbox(self.server_sided_mods_only).label("Only show server-sided mods").on_toggle(ModDownMsg::ServerSideModsChecked).width(iced::Fill)
+                    ],
+                    space().height(2),
+                    rule::horizontal(1)
+                ].spacing(5).into()
+            } else {
+                space().into()
+            };
+
+            let provider_button = |icon: SvgHandle, color: Color, name: &'static str, provider: ModProvider| -> Button<ModDownMsg> {
+                let b = button(container(row![
+                    svg(icon).style(move |t, _| svg::Style {
+                        color: Some(color)
+                    }).width(20).height(20),
+                    text(name)
+                ].spacing(5)).center_x(iced::Fill).align_y(iced::Center).padding(2));
+                if provider == self.current_provider {
+                    b
+                } else {
+                    b.on_press(ModDownMsg::ProviderButtonPressed(provider))
+                }
+            };
+
+            column![
+                row![
+                    provider_button(STATIC_IMAGES.modrinth.clone(), Color::from_rgb8(27, 217, 106), "Modrinth", ModProvider::Modrinth),
+                    provider_button(STATIC_IMAGES.curseforge.clone(), Color::from_rgb8(255, 120, 77), "Curseforge", ModProvider::Curseforge),
+                ].spacing(5),
+                row![
+                    text_input("Search...", &self.current_searchbar_text).on_input(|s| ModDownMsg::SearchTyped(s)).on_submit(ModDownMsg::SearchSubmitted).icon(text_input::Icon { font: iced::Font::DEFAULT, code_point: '⌕', size: None, spacing: 4.0, side: text_input::Side::Left }),
+                    space().width(5),
+                    button(svg(STATIC_IMAGES.filter.clone())).width(30).height(30).padding(4).on_press(ModDownMsg::FilterButtonPressed).style(button::secondary)
+                ].align_y(iced::Center),
+                filter_options,
+                row![
+                    scrollable(// mod list
+                        if self.mods_search_results.is_empty() {
+                            match self.is_search_fetching {
+                                FetchState::Fetching => Element::new(container(circular::Circular::new()).center(100)),
+                                FetchState::Done => center("no mods found :(").padding(20).into(),
+                                FetchState::Errored => column![
+                                    "error searching mods :(",
+                                    button("retry").on_press(ModDownMsg::RetrySearchPressed).style(|t,s|button::secondary(t,s))
+                                ].spacing(10).align_x(iced::Center).width(iced::Fill).padding(20).into()
                             }
                         } else {
-                            eprintln!("nonexistent thumbnail in search builder");
-                            image(&STATIC_IMAGES.missing).width(IMG_SIZE).height(IMG_SIZE).into()
-                        };
-                        let bg_color = match listing.color {
-                            Some(c) => Color {
-                                r: c.r.clamp(0., 0.5),
-                                g: c.g.clamp(0., 0.5),
-                                b: c.b.clamp(0., 0.5),
-                                a: 1.0
-                            },
-                            None => Color::from_rgb8(50, 50, 60)
-                        };
-                        column![
-                            container(
-                                row![thumbnail,column![
-                                    text(&listing.title).size(32).line_height(text::LineHeight::Relative(1.0)),
-                                    text(&listing.description).color(Color::from_rgb8(200, 200, 200)).line_height(text::LineHeight::Relative(1.2))
-                                ].spacing(2)].spacing(10)).style(move |_: &_| {
-                                    let gradient = Linear::new(Radians(PI/2.0))
-                                        .add_stop(0.0, bg_color)
-                                        .add_stop(1.0, Color::TRANSPARENT)
-                                        .into();
-
-                                    container::Style {
-                                        background: Some(iced::Background::Gradient(gradient)),
-                                        ..Default::default()
+                            column((0..self.mods_search_results.len()).into_iter().map(|i| self._create_mod_listing(i))).spacing(5).into()
+                        }
+                    ).width(320).height(iced::Fill).spacing(5).on_scroll(ModDownMsg::ModsListScrolled).id(widget::Id::new("search")),
+                    column![scrollable( // markdown section
+                        if let Some(a_mod) = &self.current_mod && let Some(listing) = self.cached_mods.get(&a_mod.id) {
+                            const IMG_SIZE:u32 = 100;
+                            let thumbnail: Element<ModDownMsg> = if let Some(url) = &listing.icon_url {
+                                if let Some(img) = self.cached_images.get(url).cloned() {
+                                    match img {
+                                        ImageType::Svg(handle) => svg(handle).width(IMG_SIZE).height(IMG_SIZE).into(),
+                                        ImageType::Raster(handle) => image(handle).width(IMG_SIZE).height(IMG_SIZE).into(),
                                     }
-                                }),
-                            MarkWidget::new(&self.markup_state).on_clicking_link(|url| {ModDownMsg::OpenLink(url)})
-                                .on_drawing_image(|info| {
-                                    if let Some(img) = self.cached_images.get(info.url).cloned() {
-                                        match img {
-                                            ImageType::Svg(handle) => {
-                                                let mut img = svg(handle);
-                                                if let Some(w) = info.width {
-                                                    img = img.width(w)
-                                                }
-                                                if let Some(h) = info.height {
-                                                    img = img.height(h);
-                                                }
-                                                img.into()
-                                            }
-                                            ImageType::Raster(handle) => {
-                                                let mut img = image(handle);
-                                                if let Some(w) = info.width {
-                                                    img = img.width(w)
-                                                }
-                                                if let Some(h) = info.height {
-                                                    img = img.height(h);
-                                                }
-                                                img.into() 
-                                            }
-                                        }
-                                    } else {
-                                        eprintln!("missing image in markdown builder"); //bluid is sussy and amond us idk if we can make it out alive guys. I have a paln to capiuture imporster and bring ande end to among us. fhe the ifn sutss6y and the amkjgh us` 89is tsupper green and the doced is green like catctus pvz i like hgarden warefare so kuch I bought games and dlc on garden warefare`
-                                        image(&STATIC_IMAGES.missing).width(128).height(128).into()
-                                    }
+                                } else {
+                                    eprintln!("Image not found in cache for search builder! Creating default image");
+                                    image(&STATIC_IMAGES.missing).width(IMG_SIZE).height(IMG_SIZE).into()
                                 }
-                            )
-                        ].spacing(10).into()
-                    } else {Element::from("")}
-                ).height(iced::Fill).width(iced::Fill).spacing(5).id(widget::Id::new("markup")), {
-                    let (select_button, picker): (Button<ModDownMsg>,Element<ModDownMsg>) = if let Some(current_mod) = &self.current_mod {
-                        if current_mod.is_in_selected_mod_list {
-                            let selected_version = self.selected_mod_versions.iter().find(|x| x.project_id == current_mod.id).expect(&format!("{} says is_in_selected_mod_list but isn't actually in selected mod list!!!",current_mod.id));
+                            } else {
+                                eprintln!("nonexistent thumbnail in search builder");
+                                image(&STATIC_IMAGES.missing).width(IMG_SIZE).height(IMG_SIZE).into()
+                            };
+                            let bg_color = match listing.color {
+                                Some(c) => Color {
+                                    r: c.r.clamp(0., 0.5),
+                                    g: c.g.clamp(0., 0.5),
+                                    b: c.b.clamp(0., 0.5),
+                                    a: 1.0
+                                },
+                                None => Color::from_rgb8(50, 50, 60)
+                            };
+                            column![
+                                container(
+                                    row![thumbnail,column![
+                                        rich_text![span(&listing.title).link(format!("https://modrinth.com/mod/{}",listing.slug)).color(Color::from_rgb8(175, 200, 240))]
+                                            .size(32).line_height(text::LineHeight::Relative(1.0)).on_link_click(ModDownMsg::OpenLink),
+                                        text(&listing.description).color(Color::WHITE).line_height(text::LineHeight::Relative(1.2))
+                                    ].spacing(2)].spacing(10)).style(move |_: &_| {
+                                        let gradient = Linear::new(Radians(PI/2.0))
+                                            .add_stop(0.0, bg_color)
+                                            .add_stop(1.0, Color::TRANSPARENT)
+                                            .into();
 
-                            (button(text("Deselect").center()).on_press(ModDownMsg::SelectVersionButtonPressed).width(80),
-                            stack![icon_pick_list(
-                                [selected_version.clone()], Some(selected_version.clone()), |_| ModDownMsg::None,
-                                    |v| v.loaders.iter().map(|l| match l {
-                                        ModLoader::Fabric => SVG_MOD_LOADERS[1].clone(),
-                                        ModLoader::NeoForge => SVG_MOD_LOADERS[2].clone(),
-                                        ModLoader::Forge => SVG_MOD_LOADERS[3].clone(),
-                                        ModLoader::Paper => SVG_MOD_LOADERS[4].clone(),
-                                        ModLoader::Purpur => SVG_MOD_LOADERS[5].clone(),
-                                        ModLoader::Folia => SVG_MOD_LOADERS[6].clone(),
-                                        ModLoader::Velocity => SVG_MOD_LOADERS[7].clone(),
-                                        _ => SVG_MOD_LOADERS[0].clone(),
-                                    }).collect_vec())
-                                    .width(iced::Fill)
-                                    .style(|t: &iced::Theme, _| icon_pick_list::Style {
-                                        background: t.extended_palette().background.weaker.color.into(),
-                                        border: border::color(t.extended_palette().secondary.base.color),
-                                        text_color: Color::from_rgb8(150, 150, 150).into(),
-                                        ..icon_pick_list::default(t, icon_pick_list::Status::Active)
+                                        container::Style {
+                                            background: Some(iced::Background::Gradient(gradient)),
+                                            ..Default::default()
+                                        }
                                     }),
-                                mouse_area(space().height(iced::Fill).width(iced::Fill)).on_press(ModDownMsg::None).interaction(mouse::Interaction::Idle)
-                            ].into())
-                        } else if !current_mod.cached_versions.is_empty() {
-                                (button(text("Select").center()).on_press(ModDownMsg::SelectVersionButtonPressed).width(80),
-                                icon_pick_list(current_mod.cached_versions.clone(), current_mod.selected_version.clone(), ModDownMsg::ModVersionPicked,
-                                    |v:&ModVersion| v.loaders.iter().map(|l| match l {
-                                        ModLoader::Fabric => SVG_MOD_LOADERS[1].clone(),
-                                        ModLoader::NeoForge => SVG_MOD_LOADERS[2].clone(),
-                                        ModLoader::Forge => SVG_MOD_LOADERS[3].clone(),
-                                        ModLoader::Paper => SVG_MOD_LOADERS[4].clone(),
-                                        ModLoader::Purpur => SVG_MOD_LOADERS[5].clone(),
-                                        ModLoader::Folia => SVG_MOD_LOADERS[6].clone(),
-                                        ModLoader::Velocity => SVG_MOD_LOADERS[7].clone(),
-                                        _ => SVG_MOD_LOADERS[0].clone(),
-                                    }).collect_vec())
-                                    .width(iced::Fill).into())
+                                // row![
+                                //     svg(STATIC_IMAGES.download.clone()).width(14).height(14).style(|t: &iced::Theme, _|svg::Style {color: Some(Color::from_rgb8(150,150,150))}),
+                                //     bold(listing.downloads.abbreviate_number(&Default::default())).style(|t: &iced::Theme|text::Style {color: Some(Color::from_rgb8(150,150,150))}).size(12),
+                                //     bold(listing.game_versions.join(",")).style(|t: &iced::Theme|text::Style {color: Some(Color::from_rgb8(150,150,150))}).size(12)
+                                // ],
+                                // rule::horizontal(1),
+                                MarkWidget::new(&self.markup_state).on_clicking_link(|url| {ModDownMsg::OpenLink(url)})
+                                    .on_drawing_image(|info| {
+                                        if let Some(img) = self.cached_images.get(info.url).cloned() {
+                                            match img {
+                                                ImageType::Svg(handle) => {
+                                                    let mut img = svg(handle);
+                                                    if let Some(w) = info.width {
+                                                        img = img.width(w)
+                                                    }
+                                                    if let Some(h) = info.height {
+                                                        img = img.height(h);
+                                                    }
+                                                    img.into()
+                                                }
+                                                ImageType::Raster(handle) => {
+                                                    let mut img = image(handle);
+                                                    if let Some(w) = info.width {
+                                                        img = img.width(w)
+                                                    }
+                                                    if let Some(h) = info.height {
+                                                        img = img.height(h);
+                                                    }
+                                                    img.into()
+                                                }
+                                            }
+                                        } else {
+                                            //eprintln!("missing image in markdown builder"); //bluid is sussy and amond us idk if we can make it out alive guys. I have a paln to capiuture imporster and bring ande end to among us. fhe the ifn sutss6y and the amkjgh us` 89is tsupper green and the doced is green like catctus pvz i like hgarden warefare so kuch I bought games and dlc on garden warefare`
+                                            image(&STATIC_IMAGES.missing).width(128).height(128).into()
+                                        }
+                                    }
+                                )
+                            ].spacing(8).into()
+                        } else {
+                            match self.is_mod_fetching {
+                                FetchState::Fetching => center(circular::Circular::new()).into(),
+                                FetchState::Done => Element::new(space()),
+                                FetchState::Errored => center("error fetching mod :(").into()
+                            }
+                        }
+                    ).height(iced::Fill).width(iced::Fill).spacing(5).id(widget::Id::new("markup")), {
+                        let (select_button, picker): (Button<ModDownMsg>,Element<ModDownMsg>) = if let Some(current_mod) = &self.current_mod {
+                            if current_mod.is_in_selected_mod_list {
+                                let selected_version = self.selected_mod_versions.iter().find(|x| x.project_id == current_mod.id).expect(&format!("{} says is_in_selected_mod_list but isn't actually in selected mod list!!!",current_mod.id));
 
+                                (button(text("Deselect").center()).on_press(ModDownMsg::SelectVersionButtonPressed).width(80),
+                                stack![icon_pick_list(
+                                    [selected_version.clone()], Some(selected_version.clone()), |_| ModDownMsg::None,
+                                        |v| v.loaders.iter().map(|l| match l {
+                                            ModLoader::Fabric => SVG_MOD_LOADERS[1].clone(),
+                                            ModLoader::NeoForge => SVG_MOD_LOADERS[2].clone(),
+                                            ModLoader::Forge => SVG_MOD_LOADERS[3].clone(),
+                                            ModLoader::Paper => SVG_MOD_LOADERS[4].clone(),
+                                            ModLoader::Purpur => SVG_MOD_LOADERS[5].clone(),
+                                            ModLoader::Folia => SVG_MOD_LOADERS[6].clone(),
+                                            ModLoader::Velocity => SVG_MOD_LOADERS[7].clone(),
+                                            _ => SVG_MOD_LOADERS[0].clone(),
+                                        }).collect_vec())
+                                        .width(iced::Fill)
+                                        .style(|t: &iced::Theme, _| icon_pick_list::Style {
+                                            background: t.extended_palette().background.weaker.color.into(),
+                                            border: border::color(t.extended_palette().secondary.base.color),
+                                            text_color: Color::from_rgb8(150, 150, 150).into(),
+                                            ..icon_pick_list::default(t, icon_pick_list::Status::Active)
+                                        }),
+                                    opaque(space().width(iced::Fill).height(iced::Fill))
+                                ].into())
+                            } else if !current_mod.cached_versions.is_empty() {
+                                    (button(text("Select").center()).on_press(ModDownMsg::SelectVersionButtonPressed).width(80),
+                                    icon_pick_list(current_mod.cached_versions.clone(), current_mod.selected_version.clone(), ModDownMsg::ModVersionPicked,
+                                        |v:&ModVersion| v.loaders.iter().map(|l| match l {
+                                            ModLoader::Fabric => SVG_MOD_LOADERS[1].clone(),
+                                            ModLoader::NeoForge => SVG_MOD_LOADERS[2].clone(),
+                                            ModLoader::Forge => SVG_MOD_LOADERS[3].clone(),
+                                            ModLoader::Paper => SVG_MOD_LOADERS[4].clone(),
+                                            ModLoader::Purpur => SVG_MOD_LOADERS[5].clone(),
+                                            ModLoader::Folia => SVG_MOD_LOADERS[6].clone(),
+                                            ModLoader::Velocity => SVG_MOD_LOADERS[7].clone(),
+                                            _ => SVG_MOD_LOADERS[0].clone(),
+                                        }).collect_vec())
+                                        .width(iced::Fill).into())
+
+                            } else {
+                                (button(text("Select").center()).width(80),
+                                container(text(""))
+                                    .padding([5, 10])
+                                    .width(iced::Fill)
+                                    .style(|t: &iced::Theme| container::Style {
+                                            background: Some(t.extended_palette().background.weaker.color.into()),
+                                            border: border::rounded(4),
+                                            ..Default::default()
+                                        })
+                                    .into())
+
+                            }
                         } else {
                             (button(text("Select").center()).width(80),
                             container(text(""))
@@ -463,100 +700,140 @@ impl ModDownloaderState {
                                     })
                                 .into())
 
-                        }
-                    } else {
-                        (button(text("Select").center()).width(80),
-                        container(text(""))
-                            .padding([5, 10])
-                            .width(iced::Fill)
-                            .style(|t: &iced::Theme| container::Style {
-                                    background: Some(t.extended_palette().background.weaker.color.into()),
-                                    border: border::rounded(4),
+                        };
+
+                        row![
+                            picker,
+                            select_button
+                        ].spacing(5)
+                    }].spacing(10)
+                ].spacing(10),
+
+                row![
+                    scrollable( container(
+                        row(self.selected_mod_versions.iter().enumerate().map(|(i, v)| {
+                            const IMG_SIZE: u32 = 48;
+                            let img:Element<_> = if let Some(url) = &v.icon_url && let Some(img) = self.cached_images.get(url) {
+                                match img {
+                                    ImageType::Svg(handle) => {
+                                        svg(handle.clone()).width(IMG_SIZE).height(IMG_SIZE).into()
+                                    }
+                                    ImageType::Raster(handle) => {
+                                        image(handle).width(IMG_SIZE).height(IMG_SIZE).into()
+                                    }
+                                }
+                            } else {
+                                image(&STATIC_IMAGES.missing).width(IMG_SIZE).height(IMG_SIZE).into()
+                            };
+                            tooltip(
+                                mouse_area(
+                                    hover(
+                                        img,
+                                        container(svg(STATIC_IMAGES.trashcan.clone()).width(32).height(32)).center(iced::Fill)
+                                            .style(|_| container::Style {
+                                                background: Some(Color::from_rgba(0.1,0.1,0.1,0.4).into()),
+                                                ..Default::default()
+                                        })
+                                    )
+                                ).on_press(ModDownMsg::SelectedVersionTrashPressed(i)),
+                                container(column![
+                                    bold(&v.project_name).size(14).color(Color::WHITE),
+                                    text(&v.version_name).size(10),
+                                    row(v.loaders.iter().map(|l|svg(match l {
+                                        ModLoader::Fabric => STATIC_IMAGES.fabric.clone(),
+                                        ModLoader::NeoForge => STATIC_IMAGES.neoforge.clone(),
+                                        ModLoader::Forge => STATIC_IMAGES.forge.clone(),
+                                        ModLoader::Paper => STATIC_IMAGES.paper.clone(),
+                                        ModLoader::Purpur => STATIC_IMAGES.purpur.clone(),
+                                        ModLoader::Folia => STATIC_IMAGES.folia.clone(),
+                                        ModLoader::Velocity => STATIC_IMAGES.velocity.clone()
+                                    }).width(20).height(20).into())).spacing(5)
+                                ].align_x(iced::Center).padding(8).spacing(5)).style(|t:&iced::Theme|container::Style {
+                                    background: Some(t.extended_palette().background.weakest.color.into()),
+                                    border: Border::default().rounded(10),
                                     ..Default::default()
-                                })
-                            .into())
-
-                    };
-
-                    row![
-                        picker,
-                        select_button
-                    ].spacing(5)
-                }].spacing(10)
-            ].spacing(10),
-
-            row![
-                scrollable( container(
-                    row(self.selected_mod_versions.iter().map(|v| {
-                        const IMG_SIZE: u32 = 48;
-                        let img:Element<_> = if let Some(url) = &v.icon_url && let Some(img) = self.cached_images.get(url) {
-                            match img {
-                                ImageType::Svg(handle) => {
-                                    svg(handle.clone()).width(IMG_SIZE).height(IMG_SIZE).into()
-                                }
-                                ImageType::Raster(handle) => {
-                                    image(handle).width(IMG_SIZE).height(IMG_SIZE).into()
-                                }
-                            }
-                        } else {
-                            image(&STATIC_IMAGES.missing).width(IMG_SIZE).height(IMG_SIZE).into()
-                        };
-                        tooltip(
-                            img,
-                            container(column![
-                                text(&v.project_name).font(Font {weight: font::Weight::Bold, ..Default::default()}).size(14).color(Color::WHITE),
-                                text(&v.version_name).size(10),
-                                row(v.loaders.iter().map(|l|svg(match l {
-                                    ModLoader::Fabric => STATIC_IMAGES.fabric.clone(),
-                                    ModLoader::NeoForge => STATIC_IMAGES.neoforge.clone(),
-                                    ModLoader::Forge => STATIC_IMAGES.forge.clone(),
-                                    ModLoader::Paper => STATIC_IMAGES.paper.clone(),
-                                    ModLoader::Purpur => STATIC_IMAGES.purpur.clone(),
-                                    ModLoader::Folia => STATIC_IMAGES.folia.clone(),
-                                    ModLoader::Velocity => STATIC_IMAGES.velocity.clone()
-                                }).width(20).height(20).into())).spacing(5)
-                            ].align_x(iced::Center).padding(5).spacing(5)).style(|t:&iced::Theme|container::Style {
-                                background: Some(t.extended_palette().background.weakest.color.into()),
-                                border: Border::default().rounded(10),
-                                ..Default::default()
-                            }),
-                            tooltip::Position::Top
-                        ).gap(8).into()
-                    })).padding(4).spacing(4)
-                )).height(52).width(400).anchor_y(scrollable::Anchor::End)
-                    .direction(scrollable::Direction::Horizontal(Scrollbar::new().width(0).scroller_width(6)))
-                    .style(|theme: &iced::Theme, status| {
-                        let empty_rail = scrollable::Rail {
-                            background: None,
-                            border: Border::default(),
-                            scroller: scrollable::Scroller {
-                                background: iced::Background::Color(Color::TRANSPARENT),
+                                }),
+                                tooltip::Position::Top
+                            ).gap(8).into()
+                        })).padding(4).spacing(4)
+                    )).height(52).width(400).anchor_y(scrollable::Anchor::End)
+                        .direction(scrollable::Direction::Horizontal(Scrollbar::new().width(0).scroller_width(6)))
+                        .style(|theme: &iced::Theme, status| {
+                            let empty_rail = scrollable::Rail {
+                                background: None,
                                 border: Border::default(),
-                            },
-                        };
-                        let mut style = scrollable::Style {
-                            container: theme.extended_palette().background.weaker.color.into(),
-                            ..scrollable::default(theme, status)
-                        };
-                        if let scrollable::Status::Active {
-                            is_horizontal_scrollbar_disabled,
-                            is_vertical_scrollbar_disabled,
-                            ..
-                        } = status
-                        {
-                            if !is_horizontal_scrollbar_disabled {
-                                style.horizontal_rail = empty_rail;
+                                scroller: scrollable::Scroller {
+                                    background: iced::Background::Color(Color::TRANSPARENT),
+                                    border: Border::default(),
+                                },
+                            };
+                            let mut style = scrollable::Style {
+                                container: theme.extended_palette().background.weaker.color.into(),
+                                ..scrollable::default(theme, status)
+                            };
+                            if let scrollable::Status::Active {
+                                is_horizontal_scrollbar_disabled,
+                                is_vertical_scrollbar_disabled,
+                                ..
+                            } = status
+                            {
+                                if !is_horizontal_scrollbar_disabled {
+                                    style.horizontal_rail = empty_rail;
+                                }
+                                if !is_vertical_scrollbar_disabled {
+                                    style.vertical_rail = empty_rail;
+                                }
                             }
-                            if !is_vertical_scrollbar_disabled {
-                                style.vertical_rail = empty_rail;
-                            }
-                        }
-                        style
-                }
-                ),
-                button("Download").on_press(ModDownMsg::DownloadButtonPressed)
-            ]
-        ].spacing(10).padding(15).into()
+                            style
+                    }
+                    ),
+                    button("Download").on_press(ModDownMsg::DownloadButtonPressed)
+                ]
+            ].spacing(10).padding(15)
+        };
+
+        match &self.popup_state {
+            PopupState::None => stack![view].into(),
+            PopupState::CloseConfirmation => stack![
+                view,
+                Self::create_dialog(
+                    "Confirm close",
+                    format!("Are you sure you want to close?\nyou have {} mods selected.",self.selected_mod_versions.len()),
+                    row![button("Close").on_press(ModDownMsg::ConfirmCloseButtonPressed),
+                    button("Cancel").on_press(ModDownMsg::CancelCloseButtonPressed).style(|t: &iced::Theme,s| {
+                        button::secondary(t,s)
+                    })].spacing(5).into()
+                )
+            ].into(),
+            PopupState::NetworkError(title, body) => stack![
+                view,
+                Self::create_dialog(
+                    title,
+                    body.clone(),
+                    button("Ok :(").on_press(ModDownMsg::CancelCloseButtonPressed).into()
+                )
+            ].into(),
+            PopupState::DownloadConfirmation => stack![
+                view,
+                opaque(center(container(column![
+                    bold("Confirm Download").size(20),
+                    text("are you sure you want to download:"),
+                    row![space().width(15),iced_selection::text("are you sure?").line_height(1.5).wrapping(text::Wrapping::WordOrGlyph)],
+                    right(row![
+                        button("Cancel").on_press(ModDownMsg::CancelCloseButtonPressed).style(|t: &iced::Theme,s| {
+                            button::secondary(t,s)
+                        })
+                    ])
+                ].padding(25).spacing(8)
+                ).width(600).height(650)
+                    .style(|t: &iced::Theme| container::Style {
+                        background: Some(deviate(t.palette().background,-0.0).into()),
+                        border: Border::default().rounded(10).color(t.extended_palette().background.stronger.color).width(1.5),
+                        ..Default::default()
+                    })
+                ).center(iced::Fill))
+            ].into()
+        }
     }
 
     pub fn new(program_data: &crate::ProgramData) -> (Self, Task<Message>) {
@@ -565,11 +842,31 @@ impl ModDownloaderState {
 
         update_selection(&mut state.selected_filter_versions, Some(program_data.version.clone()), SelectionState::Included);
         update_selection(&mut state.selected_filter_loaders, Some(program_data.loader), SelectionState::Included);
-        let task = state._new_mod_search();
+        let task = Task::batch([
+            state._new_mod_search(),
+            Task::perform(reqwests::get_categories(), ModDownMsg::CategoriesReceived).map(|m|SuperMsg(m))
+        ]);
         (state,task)
     }
 
-    pub fn spotlight_mod(&mut self) -> Task<Message> {
+    fn set_popup_state(&mut self, state: PopupState) {
+        self.popup_state = match state {
+            PopupState::None => {PopupState::None}
+            PopupState::CloseConfirmation => {PopupState::CloseConfirmation},
+            PopupState::NetworkError(title, body) => {
+                if let PopupState::CloseConfirmation = self.popup_state {return}
+                if let PopupState::NetworkError(_, _) = self.popup_state {return}
+                PopupState::NetworkError(title, body)
+            }
+            PopupState::DownloadConfirmation => {
+                if let PopupState::CloseConfirmation = self.popup_state {return}
+                if let PopupState::NetworkError(_, _) = self.popup_state {return}
+                PopupState::DownloadConfirmation
+            }
+        }
+    }
+
+    fn spotlight_mod(&mut self) -> Task<Message> {
         let Some(mod_info) = &self.current_mod else {return Task::none()};
         let mod_data = self.cached_mods.get(&mod_info.id).unwrap();
         self.markup_state = MarkState::with_html_and_markdown(&mod_data.body);
@@ -581,10 +878,26 @@ impl ModDownloaderState {
             self._download_markup_images().map(|m| SuperMsg(m)),
         ])
     }
+    fn create_dialog<'a>(title: &'static str, body: String, buttons: Element<'a, ModDownMsg>) -> Element<'a, ModDownMsg> {
+        opaque(center(container(column![
+            iced_selection::text(title).size(20).font(Font {weight: font::Weight::Bold, ..Default::default()}),
+            row![space().width(15),iced_selection::text(body).line_height(1.5).wrapping(text::Wrapping::WordOrGlyph)],
+            right(buttons)
+        ].padding(25).spacing(8)
+        ).width(600)
+            .style(|t: &iced::Theme| container::Style {
+                background: Some(deviate(t.palette().background,-0.0).into()),
+                border: Border::default().rounded(10).color(t.extended_palette().background.stronger.color).width(1.5),
+                ..Default::default()
+            })
+        ).center(iced::Fill))
+
+    }
 
     fn _create_mod_listing(&'_ self, mods_list_index: usize) -> Element<'_, ModDownMsg> {
         const IMG_SIZE: u32 = 75;
         let listing = &self.mods_search_results[mods_list_index];
+        let is_selected = self.cached_mods.get(&listing.project_id).map_or(false, |m|m.is_in_selected_mod_list);
         let thumbnail: Element<ModDownMsg> = if let Some(url) = &listing.icon_url {
             if let Some(img) = self.cached_images.get(url).cloned() {
                 match img {
@@ -610,28 +923,41 @@ impl ModDownloaderState {
                 .height(IMG_SIZE)
                 .into()
         };
+        let title = if is_selected {
+            bold(&listing.title)
+        } else {
+            text(&listing.title)
+        };
         let contents = row![
             container(thumbnail).padding([0, 5]),
             column![
-                listing.title.as_str(),
-                text(&listing.description)
-                    .size(10)
-                    .color(Color::from_rgb8(200, 200, 200))
+                title,
+                text(&listing.description).size(10)
             ]
             .max_width(215)
         ];
-        let mut button = button(contents)
+        let button = button(contents)
             .on_press_with(move || ModDownMsg::ModListingPressed(mods_list_index))
             .height(80)
             .width(iced::Fill)
-            .padding([5, 0]);
-        if let Some(a_mod) = &self.current_mod && a_mod.id == listing.project_id {
-            button = button.style(|t, s| button::Style {
-                background: Some(Color::from_rgb8(58, 62, 69).into()),
-                text_color: Color::WHITE,
-                ..button::Style::default()
+            .padding([5, 0])
+            .style(move |t,s| {
+                let pair = if let Some(a_mod) = &self.current_mod && a_mod.id == listing.project_id {
+                    t.extended_palette().secondary.weak
+                } else {
+                    t.extended_palette().primary.base
+                };
+                button::Style {
+                    background: Some(pair.color.into()),
+                    border: if is_selected {
+                        border::rounded(2).width(4).color(deviate(pair.color.into(), 0.1))
+                    } else {
+                        border::rounded(2)
+                    },
+                    text_color: pair.text,
+                    ..Default::default()
+                }
             });
-        }
         button.into()
     }
 
@@ -646,7 +972,8 @@ impl ModDownloaderState {
     }
 
     fn _new_mod_search(&mut self) -> Task<Message> {
-        self.is_search_fetching = true;
+        self.is_search_fetching = FetchState::Fetching;
+        self.search_fetching_sequence_number += 1;
         self.mods_search_results.clear();
         self.mods_search_offset = 0;
 
@@ -671,6 +998,10 @@ impl ModDownloaderState {
             let a = self.selected_filter_loaders.iter().map(|(l,_)|format!("\"categories:{}\"",l.unwrap().to_string())).join(",");
             args.push(a);
         }
+        if !self.selected_filter_categories.is_empty() {
+            let a = self.selected_filter_categories.iter().map(|(c,_)|format!("\"categories:{}\"",c.as_ref().unwrap()));
+            args.extend(a);
+        }
 
         Task::perform(
             reqwests::search_mods(
@@ -686,7 +1017,7 @@ impl ModDownloaderState {
         let loaders = self.selected_filter_loaders.iter().map(|(l,_)|l.unwrap().to_string().to_ascii_lowercase()).collect();
         let game_versions = self.selected_filter_versions.iter().map(|(v,_)|v.as_ref().unwrap().id.clone()).collect();
 
-        Task::perform(reqwests::get_mod_versions(id, loaders, game_versions),ModDownMsg::ModVersionsReceived).map(|m|SuperMsg(m))
+        Task::perform(reqwests::get_available_mod_versions(id, loaders, game_versions), ModDownMsg::ModVersionsReceived).map(|m|SuperMsg(m))
     }
 }
 
@@ -730,6 +1061,15 @@ struct ModrinthMod {
     // gallery: Vec<String>,
 }
 
+struct SearchListing {
+    title: String,
+    description: String,
+    icon_url: Option<String>,
+    project_id: String,
+    author: String,
+    downloads: i64,
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct ModrinthSearchResult {
     slug: String,
@@ -764,7 +1104,7 @@ struct ModrinthSearch {
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct ModrinthVersion {
+struct ModrinthVersionDownload { // used for the list of versions (and dependencies) when "download" is pressed.
     name: String,
     id: String,
     project_id: String,
@@ -776,10 +1116,13 @@ struct ModrinthVersion {
     dependencies: Vec<ModrinthDependency>,
     version_type: String,
 }
-// #[derive(Debug, serde::Deserialize)]
-// struct ModrinthModFile {
-//
-// }
+
+#[derive(Debug, serde::Deserialize)]
+struct ModrinthVersionMass { // used for the list of versions in a mod listing
+    name: String,
+    id: String,
+    loaders: Vec<String>,
+}
 
 #[derive(Clone, Debug)]
 struct ModVersion {
@@ -799,7 +1142,11 @@ impl PartialEq for ModVersion {
     }
 }
 
-#[derive(Debug, PartialEq)]
+struct ModrinthFile {
+
+}
+
+#[derive(Debug)]
 struct ModVersionQueued { // it's a separate struct so it can have a nice icon and stuff
     icon_url: Option<String>,
 
@@ -807,11 +1154,17 @@ struct ModVersionQueued { // it's a separate struct so it can have a nice icon a
     project_id: String,
     version_name: String,
     version_id: String,
+
     loaders: Vec<ModLoader>,
 }
 impl Display for ModVersionQueued {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.version_name)
+    }
+}
+impl PartialEq for ModVersionQueued {
+    fn eq(&self, other: &Self) -> bool {
+        self.version_id == other.version_id
     }
 }
 
@@ -840,4 +1193,10 @@ where
         .map_err(serde::de::Error::custom)?;
 
     Ok(Some(Color::from_rgb8(r, g, b)))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ModrinthCategory {
+    name: String,
+    project_type: String,
 }

@@ -99,7 +99,7 @@ pub async fn fetch_mod(id: String) -> Result<Vec<u8>, String> {
     }
 }
 
-pub async fn get_mod_versions(id: String, loaders: Vec<String>, game_versions: Vec<String>) -> Result<(String, Vec<u8>), String> {
+pub async fn get_available_mod_versions(id: String, loaders: Vec<String>, game_versions: Vec<String>) -> Result<(String, Vec<u8>), String> {
     let mut args: Vec<(&'static str, String)> = vec![];
 
     if !loaders.is_empty() {
@@ -134,16 +134,62 @@ pub async fn get_mod_versions(id: String, loaders: Vec<String>, game_versions: V
     }
 }
 
-pub async fn get_mod_version(id: String) -> Result<Vec<u8>, String> {
+// pub async fn get_mod_version(id: String) -> Result<Vec<u8>, String> {
+//     let response = crate::REQ_CLIENT
+//         .get(format!("https://api.modrinth.com/v2/version/{id}"))
+//         .send()
+//         .await
+//         .map_err(|err| err.to_string())?;
+//
+//     if !response.status().is_success() {
+//         Err(format!(
+//             "Error {} from version fetch for id {id}",
+//             response.status(),
+//         ))
+//     } else {
+//         let bytes = response
+//             .bytes()
+//             .await
+//             .map_err(|err| err.to_string())?
+//             .to_vec();
+//         Ok(bytes)
+//     }
+// }
+
+pub async fn get_mod_versions(version_ids: Vec<String>) -> Result<Vec<u8>, String> {
     let response = crate::REQ_CLIENT
-        .get(format!("https://api.modrinth.com/v2/version/{id}"))
+        .get("https://api.modrinth.com/v2/versions")
+        .query(&[("ids", format!("[{}]",version_ids.join(", ")))])
         .send()
         .await
         .map_err(|err| err.to_string())?;
 
     if !response.status().is_success() {
         Err(format!(
-            "Error {} from version fetch for id {id}",
+            "Error {} from versions list fetch with args {:?}",
+            response.status(),
+            version_ids
+        ))
+    } else {
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|err| err.to_string())?
+            .to_vec();
+        Ok(bytes)
+    }
+}
+
+pub async fn get_categories() -> Result<Vec<u8>, String> {
+    let response = crate::REQ_CLIENT
+        .get("https://api.modrinth.com/v2/tag/category")
+        .send()
+        .await
+        .map_err(|err| err.to_string())?;
+
+    if !response.status().is_success() {
+        Err(format!(
+            "Error {} from categories fetch",
             response.status(),
         ))
     } else {
@@ -154,6 +200,4 @@ pub async fn get_mod_version(id: String) -> Result<Vec<u8>, String> {
             .to_vec();
         Ok(bytes)
     }
-
-
 }

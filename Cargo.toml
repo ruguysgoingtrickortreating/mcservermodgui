@@ -20,6 +20,8 @@ webbrowser = "1.0.6"
 zip = "6.0.0"
 itertools = "0.14.0"
 iced_aw = "0.13.0"
+iced_selection = "0.4.0"
+rs-abbreviation-number = "0.3.2"
 
 # [features]
 # debug = ["iced/hot"]

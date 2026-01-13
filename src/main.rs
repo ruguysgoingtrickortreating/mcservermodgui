@@ -3,7 +3,7 @@ use std::{cell::OnceCell, collections::HashMap, sync::{Arc, LazyLock, OnceLock}}
 use std::cell::RefCell;
 use std::fmt::{Display, Formatter};
 use std::sync::RwLock;
-use iced::{Color, Element, Task, advanced::{image::Handle as RasterHandle, svg::Handle as SvgHandle}, widget::{button, checkbox, column, pick_list}, window};
+use iced::{Color, Element, Task, advanced::{image::Handle as RasterHandle, svg::Handle as SvgHandle}, widget::{button, checkbox, column, pick_list}, window, Subscription};
 use iced::advanced::svg::Svg;
 use reqwest::Client;
 
@@ -24,6 +24,9 @@ struct _StaticImages {
 
     file: SvgHandle,
     filter: SvgHandle,
+    trashcan: SvgHandle,
+    user: SvgHandle,
+    download: SvgHandle,
 
     modrinth: SvgHandle,
     curseforge: SvgHandle,
@@ -48,6 +51,9 @@ static STATIC_IMAGES: LazyLock<_StaticImages> = LazyLock::new(|| _StaticImages {
 
     file: SvgHandle::from_memory(include_bytes!("../assets/folder.svg")),
     filter: SvgHandle::from_memory(include_bytes!("../assets/filter.svg")),
+    trashcan: SvgHandle::from_memory(include_bytes!("../assets/trashcan.svg")),
+    user: SvgHandle::from_memory(include_bytes!("../assets/user.svg")),
+    download: SvgHandle::from_memory(include_bytes!("../assets/download.svg")),
 
     modrinth: SvgHandle::from_memory(include_bytes!("../assets/modrinth.svg")),
     curseforge: SvgHandle::from_memory(include_bytes!("../assets/curseforge.svg")),
@@ -105,6 +111,14 @@ enum ModLoader {
     Velocity,
 }
 
+#[derive(Default, Debug, Copy, Clone, PartialEq)]
+enum ModProvider {
+    #[default]
+    Modrinth,
+    Curseforge,
+    Hangar
+}
+
 #[derive(serde::Serialize,Debug,Clone,PartialEq)]
 enum VersionKind {
     Release,
@@ -132,7 +146,8 @@ fn main() -> iced::Result {
             let app = AppState::default();
 
             (app,Task::done(Message::OpenWindow(WindowType::Init)))
-        },AppState::update,
+        },
+        AppState::update,
         AppState::view
     )
         // .theme(iced::Theme::Custom(Arc::new(iced::theme::Custom::new("".to_string(), iced::theme::Palette {
@@ -140,7 +155,7 @@ fn main() -> iced::Result {
         //     ..iced::theme::Palette::DARK
         // })))).antialiasing(true)
         .theme(iced::Theme::KanagawaDragon)
-        .subscription(|_| window::close_events().map(Message::WindowClosed))
+        .subscription(|_| Subscription::batch([window::close_events().map(Message::WindowClosed),window::close_requests().map(Message::WindowCloseRequested)]))
         .run()
 }
 
@@ -148,8 +163,10 @@ fn main() -> iced::Result {
 enum Message {
     OpenLink(String),
     OpenWindow(WindowType),
+    CloseWindow(WindowType),
 
     WindowOpened,
+    WindowCloseRequested(window::Id),
     WindowClosed(window::Id),
 
     InitMessage(InitMessage),
@@ -173,7 +190,7 @@ impl AppState {
             Message::OpenWindow(win_type) => {
                 println!("#openingwindow #gay");
                 let task: Task<Message>;
-                let settings = window::Settings::default();
+                let settings;
                 match win_type {
                     WindowType::ModDownload => {
                         let Some(main_state) = self.main_state.as_mut() else {panic!("Had ModDownloader window without corresponding main window")};
@@ -182,6 +199,11 @@ impl AppState {
                         let (state,t) = ModDownloaderState::new(&main_state.program_data);
                         task = t;
                         main_state.mod_downloader_state = Some(state);
+
+                        settings = window::Settings {
+                            exit_on_close_request: false,
+                            ..Default::default()
+                        };
                     }
                     WindowType::Init => {
                         if self.init_state.is_some() {panic!("Tried to open Init window while Init state already exists")};
@@ -189,19 +211,15 @@ impl AppState {
                         let mut state = InitState::default();
                         task = state.init().map(|v| Message::InitMessage(v));
                         self.init_state = Some(state);
+
+                        settings = window::Settings::default();
                     }
                     WindowType::Setup => {
-                        // println!("made me a setup 😋");
-                        // // if self.setup_state.is_some() {panic!("Tried to open Setup window while Setup state already exists")};
-
-                        // let state = SetupState::default();
-                        // task = Task::none();
-                        // self.setup_state = Some(state);
                         panic!("setup should not be opened on its own")
                     },
                     WindowType::Main => {
-                        println!("made me a main 😋");
-                        todo!()
+                        // println!("made me a main 😋");
+                        panic!("main should not be opened in its own")
                     },
                 };
                 let (id, open) = window::open(settings);
@@ -209,7 +227,17 @@ impl AppState {
                 self.windows.insert(id, win);
                 return Task::batch([open.map(|_| Message::WindowOpened),task])
             }
+            Message::CloseWindow(win_type) => {
+                assert!(matches!(win_type, WindowType::ModDownload));
+                let id = dbg!(self.windows.iter().find(|(k,v)| v.window_type == win_type).unwrap()).0;
+                return window::close(*id);
+            }
             Message::WindowOpened => (),
+            Message::WindowCloseRequested(id) => {
+                let w = self.windows.get(&id).unwrap();
+                assert!(matches!(w.window_type, WindowType::ModDownload),"Requested close on a non-ModDownload window!!!");
+                return Task::done(Message::ModDLMessage(ModDownMsg::CloseRequested));
+            }
             Message::WindowClosed(id) => {
                 let w = self.windows.remove(&id).unwrap();
                 match w.window_type {
@@ -282,6 +310,10 @@ impl AppState {
     }
 }
 
+pub fn bold<'a, M: iced::widget::text::Catalog + 'a>(content: impl iced::widget::text::IntoFragment<'a>) -> iced::widget::Text<'a, M> {
+    iced::widget::text(content).font(iced::Font {weight: iced::font::Weight::Bold, ..Default::default()})
+}
+
 // pub enum ProgramPhase {
 //     Init(InitState),
 //     Setup(SetupState),
@@ -296,6 +328,7 @@ pub enum WindowType {
     ModDownload,
 }
 
+#[derive(Debug)]
 pub struct Window {
     pub window_type: WindowType
 }

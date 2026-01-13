@@ -371,7 +371,7 @@ impl StyleSheet for iced::Theme {
         Appearance {
             background: None,
             track_color: palette.background.weak.color,
-            bar_color: palette.primary.base.color,
+            bar_color: palette.primary.strong.color,
         }
     }
 }

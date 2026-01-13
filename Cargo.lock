@@ -2042,6 +2042,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "iced_selection"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67f18f594469b7a72647621cf1c374716243b2aea0617f50eaf7507c621a8e01"
+dependencies = [
+ "iced_widget",
+ "unicode-segmentation",
+]
+
+[[package]]
 name = "iced_tiny_skia"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2667,10 +2677,12 @@ dependencies = [
  "frostmark",
  "iced",
  "iced_aw",
+ "iced_selection",
  "iced_widget_extra",
  "itertools",
  "rand 0.9.2",
  "reqwest",
+ "rs-abbreviation-number",
  "serde",
  "serde_json",
  "serde_path_to_error",
@@ -4028,6 +4040,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
 
 [[package]]
+name = "rs-abbreviation-number"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ffbe68a09a59740bcd2d73972601b97c51d82a5ec83cafdbf6ff6883925e017"
+dependencies = [
+ "time_macro",
+ "time_macro_derive",
+]
+
+[[package]]
 name = "rustc-hash"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4790,6 +4812,22 @@ name = "time-core"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40868e7c1d2f0b8d73e4a8c7f0ff63af4f6d19be117e90bd73eb1d62cf831c6b"
+
+[[package]]
+name = "time_macro"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65a819dbcae573521af2b2a9bd345b9443619ecfc9b70647ff25d87279dc3b73"
+
+[[package]]
+name = "time_macro_derive"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ff7c73ff78b7be9d81624666e675b7ced5e29e620dff9fbd486027872a3feb5"
+dependencies = [
+ "quote",
+ "syn",
+]
 
 [[package]]
 name = "tiny-skia"

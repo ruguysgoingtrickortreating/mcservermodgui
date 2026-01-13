@@ -113,6 +113,7 @@ impl SetupState {
                     .style(|_, _| checkbox::Style {
                         icon_color: Color::WHITE,
                         text_color: Some(Color::from_rgb8(180, 180, 180)),
+                        
                         background: iced::Background::Color(Color::TRANSPARENT),
                         border: Border::default().color(Color::WHITE).rounded(2).width(1)
                     }
